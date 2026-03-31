@@ -65,9 +65,10 @@ atomic<int>      updateSpeed{1};
 atomic<bool>     running{true};
 
 // Motion mode working buffers — pre-allocated in main, used only in main thread
-Mat motionMap;  // CV_32F, 0.0 (still) → 1.0 (max motion), per-pixel
-Mat diffMat;    // CV_8UC3 scratch for absdiff
-Mat grayDiff;   // CV_8U  scratch for grayscale + blur
+Mat motionMap;   // CV_32F, 0.0 (still) → 1.0 (max motion), per-pixel
+Mat diffMat;     // CV_8UC3 scratch for absdiff
+Mat grayDiff;    // CV_8U  scratch for grayscale + blur
+Mat motionSmall; // CV_8U  scratch for motion blur at FLOW_SCALE resolution
 
 // Prismatic echo settings (runtime-adjustable with Up/Down in prismatic mode)
 int echoSpacing = 15;  // Frames between each of 6 hue-tinted echoes (1 – BUFFER_SIZE/6)
@@ -129,13 +130,16 @@ void captureLoop(VideoCapture& cap) {
 
         flip(frame, frame, 1);
 
-        // Write the same captured frame `speed` times so the time-gradient
-        // steepens without touching applyTimeDisplacement logic.
+        // Write the captured frame once, then copy from the warm slot for
+        // subsequent speed steps — avoids re-reading the source frame from memory.
         int speed = updateSpeed.load(memory_order_relaxed);
-        for (int i = 0; i < speed; i++) {
-            int idx = writeIndex.load(memory_order_relaxed);
-            frame.copyTo(frameBuffer[idx]);
-            // release: guarantees the copyTo is visible before the index update
+        int idx   = writeIndex.load(memory_order_relaxed);
+        frame.copyTo(frameBuffer[idx]);
+        writeIndex.store((idx + 1) % BUFFER_SIZE, memory_order_release);
+        for (int i = 1; i < speed; i++) {
+            int prev = idx;
+            idx = writeIndex.load(memory_order_relaxed);
+            frameBuffer[prev].copyTo(frameBuffer[idx]);
             writeIndex.store((idx + 1) % BUFFER_SIZE, memory_order_release);
         }
     }
@@ -185,11 +189,17 @@ void applyTimeDisplacement(Mat& output, int width, int height, int bufIdx) {
     }
     else if (currentMode == "ad") {
         int centerX = width / 2;
-        #pragma omp parallel for schedule(static)
+        // Precompute frame index per column, then copy row-by-row (cache-friendly)
+        vector<int> colFrame(width);
         for (int x = 0; x < width; x++) {
             int dist = abs(x - centerX);
-            int frameOffset = (bufIdx - 1 - (dist * BUFFER_SIZE / max(centerX, 1)) + BUFFER_SIZE * 2) % BUFFER_SIZE;
-            frameBuffer[frameOffset].col(x).copyTo(output.col(x));
+            colFrame[x] = (bufIdx - 1 - (dist * BUFFER_SIZE / max(centerX, 1)) + BUFFER_SIZE * 2) % BUFFER_SIZE;
+        }
+        #pragma omp parallel for schedule(static)
+        for (int y = 0; y < height; y++) {
+            Vec3b* outRow = output.ptr<Vec3b>(y);
+            for (int x = 0; x < width; x++)
+                outRow[x] = frameBuffer[colFrame[x]].ptr<Vec3b>(y)[x];
         }
     }
     else if (currentMode == "w") {
@@ -207,17 +217,25 @@ void applyTimeDisplacement(Mat& output, int width, int height, int bufIdx) {
         }
     }
     else if (currentMode == "a") {
+        vector<int> colFrame(width);
+        for (int x = 0; x < width; x++)
+            colFrame[x] = (bufIdx - ((width - 1 - x) * BUFFER_SIZE / width) + BUFFER_SIZE) % BUFFER_SIZE;
         #pragma omp parallel for schedule(static)
-        for (int x = 0; x < width; x++) {
-            int frameOffset = (bufIdx - ((width - 1 - x) * BUFFER_SIZE / width) + BUFFER_SIZE) % BUFFER_SIZE;
-            frameBuffer[frameOffset].col(x).copyTo(output.col(x));
+        for (int y = 0; y < height; y++) {
+            Vec3b* outRow = output.ptr<Vec3b>(y);
+            for (int x = 0; x < width; x++)
+                outRow[x] = frameBuffer[colFrame[x]].ptr<Vec3b>(y)[x];
         }
     }
     else if (currentMode == "d") {
+        vector<int> colFrame(width);
+        for (int x = 0; x < width; x++)
+            colFrame[x] = (bufIdx - (x * BUFFER_SIZE / width) + BUFFER_SIZE) % BUFFER_SIZE;
         #pragma omp parallel for schedule(static)
-        for (int x = 0; x < width; x++) {
-            int frameOffset = (bufIdx - (x * BUFFER_SIZE / width) + BUFFER_SIZE) % BUFFER_SIZE;
-            frameBuffer[frameOffset].col(x).copyTo(output.col(x));
+        for (int y = 0; y < height; y++) {
+            Vec3b* outRow = output.ptr<Vec3b>(y);
+            for (int x = 0; x < width; x++)
+                outRow[x] = frameBuffer[colFrame[x]].ptr<Vec3b>(y)[x];
         }
     }
     else if (currentMode == "motion") {
@@ -255,16 +273,18 @@ void applyTimeDisplacement(Mat& output, int width, int height, int bufIdx) {
         // Moving pixels get B/G/R channels pulled from progressively older frames,
         // with the spread (in frames) scaling linearly with local motion intensity.
         // motionMap must be computed by the caller before this function.
+        // idxB is constant for the whole frame — hoist out of both loops
+        int idxB = (bufIdx - 1 + BUFFER_SIZE * 2) % BUFFER_SIZE;
         #pragma omp parallel for schedule(static)
         for (int y = 0; y < height; y++) {
             const float* motionRow = motionMap.ptr<float>(y);
             Vec3b*       outRow    = output.ptr<Vec3b>(y);
+            const Vec3b* rowB      = frameBuffer[idxB].ptr<Vec3b>(y);
             for (int x = 0; x < width; x++) {
                 int spread = (int)(motionRow[x] * chromaSpread);
-                int idxB = (bufIdx - 1           + BUFFER_SIZE * 2) % BUFFER_SIZE;
-                int idxG = (bufIdx - 1 - spread  + BUFFER_SIZE * 2) % BUFFER_SIZE;
-                int idxR = (bufIdx - 1 - spread*2 + BUFFER_SIZE * 4) % BUFFER_SIZE;
-                outRow[x][0] = frameBuffer[idxB].ptr<Vec3b>(y)[x][0];  // B ← newest
+                int idxG = (bufIdx - 1 - spread   + BUFFER_SIZE * 2) % BUFFER_SIZE;
+                int idxR = (bufIdx - 1 - spread*2  + BUFFER_SIZE * 4) % BUFFER_SIZE;
+                outRow[x][0] = rowB[x][0];                                           // B ← newest
                 outRow[x][1] = frameBuffer[idxG].ptr<Vec3b>(y)[x][1];  // G ← spread ago
                 outRow[x][2] = frameBuffer[idxR].ptr<Vec3b>(y)[x][2];  // R ← 2× spread ago
             }
@@ -280,13 +300,15 @@ void applyTimeDisplacement(Mat& output, int width, int height, int bufIdx) {
         //   R ← echoes 0(red), 1(yellow), 5(magenta)
         //   G ← echoes 1(yellow), 2(green), 3(cyan)
         //   B ← echoes 3(cyan),  4(blue),  5(magenta)
+        // Frame indices are independent of y — hoist out of the parallel loop
+        int fi[6];
+        for (int e = 0; e < 6; e++)
+            fi[e] = (bufIdx - 1 - e * echoSpacing + BUFFER_SIZE * 4) % BUFFER_SIZE;
         #pragma omp parallel for schedule(static)
         for (int y = 0; y < height; y++) {
             const Vec3b* src[6];
-            for (int e = 0; e < 6; e++) {
-                int fi = (bufIdx - 1 - e * echoSpacing + BUFFER_SIZE * 4) % BUFFER_SIZE;
-                src[e] = frameBuffer[fi].ptr<Vec3b>(y);
-            }
+            for (int e = 0; e < 6; e++)
+                src[e] = frameBuffer[fi[e]].ptr<Vec3b>(y);
             Vec3b* outRow = output.ptr<Vec3b>(y);
             for (int x = 0; x < width; x++) {
                 float sumR = src[0][x][2] + src[1][x][2] + src[5][x][2];
@@ -319,13 +341,17 @@ void applyTimeDisplacement(Mat& output, int width, int height, int bufIdx) {
             int yEnd   = min(yStart + glitchBandHeight, height);
             if (glitchBands[b].active) {
                 int fi    = (bufIdx - 1 - glitchBands[b].frameOffset + BUFFER_SIZE * 2) % BUFFER_SIZE;
-                int shift = glitchBands[b].hShift;
+                // Normalise shift to [0, width) once — avoids per-pixel modulo
+                int s = ((glitchBands[b].hShift % width) + width) % width;
                 for (int y = yStart; y < yEnd; y++) {
                     const Vec3b* src = frameBuffer[fi].ptr<Vec3b>(y);
                     Vec3b*       dst = output.ptr<Vec3b>(y);
-                    for (int x = 0; x < width; x++) {
-                        int sx = (x - shift % width + width) % width;
-                        dst[x] = src[sx];
+                    // Two memcpy segments replace the per-pixel index calculation
+                    if (s == 0) {
+                        memcpy(dst, src, width * sizeof(Vec3b));
+                    } else {
+                        memcpy(dst,           src + (width - s), s           * sizeof(Vec3b));
+                        memcpy(dst + s,       src,               (width - s) * sizeof(Vec3b));
                     }
                 }
             } else {
@@ -472,6 +498,7 @@ int main() {
     smallCurrBGR  = Mat::zeros(flowH, flowW, CV_8UC3);
     prevGraySmall = Mat::zeros(flowH, flowW, CV_8U);
     currGraySmall = Mat::zeros(flowH, flowW, CV_8U);
+    motionSmall   = Mat::zeros(flowH, flowW, CV_8U);
     cout << "Flow buffers: " << flowW << "x" << flowH << " (1/" << (int)(1/FLOW_SCALE) << " scale)" << endl;
 
     // Pre-allocate datamosh working buffers
@@ -534,7 +561,10 @@ int main() {
             int older  = (bufIdx - 1 - MOTION_LOOKBACK + BUFFER_SIZE * 2) % BUFFER_SIZE;
             cv::absdiff(frameBuffer[recent], frameBuffer[older], diffMat);
             cv::cvtColor(diffMat, grayDiff, COLOR_BGR2GRAY);
-            cv::GaussianBlur(grayDiff, grayDiff, Size(MOTION_BLUR_SIZE, MOTION_BLUR_SIZE), 0);
+            // Blur at FLOW_SCALE resolution (~16× fewer pixels) then upsample
+            cv::resize(grayDiff, motionSmall, motionSmall.size(), 0, 0, INTER_LINEAR);
+            cv::GaussianBlur(motionSmall, motionSmall, Size(MOTION_BLUR_SIZE, MOTION_BLUR_SIZE), 0);
+            cv::resize(motionSmall, grayDiff, grayDiff.size(), 0, 0, INTER_LINEAR);
             grayDiff.convertTo(motionMap, CV_32F, 1.0 / 255.0);
         }
 
@@ -594,9 +624,12 @@ int main() {
         // 3. Decay: multiply by rippleDecay (~1 second lifetime at 60fps).
         // 4. Inject: where flow is strong, add a fresh saturated directional color additively.
         if (currentMode == "flowripple") {
-            const float PI2 = 2.0f * 3.14159265f;
+            const float PI2     = 2.0f * 3.14159265f;
+            const float invSens = 1.0f / flowSensitivity;
+            const float invPI2  = 360.0f / PI2;
 
             // Step 1: build backward-warp maps (pixel at (x,y) came from (x-vx, y-vy))
+            #pragma omp parallel for schedule(static)
             for (int y = 0; y < actualHeight; y++) {
                 const Vec2f* flowRow = flowMap.ptr<Vec2f>(y);
                 float* mx = rippleMapX.ptr<float>(y);
@@ -615,6 +648,7 @@ int main() {
             rippleTmp *= rippleDecay;
 
             // Step 4: inject fresh directional color where motion exceeds threshold
+            #pragma omp parallel for schedule(static)
             for (int y = 0; y < actualHeight; y++) {
                 const Vec2f* flowRow = flowMap.ptr<Vec2f>(y);
                 Vec3f*       ripRow  = rippleTmp.ptr<Vec3f>(y);
@@ -624,8 +658,8 @@ int main() {
                     float mag = sqrtf(vx*vx + vy*vy);
                     if (mag < 0.5f) continue;
 
-                    float alpha = min(mag / flowSensitivity, 1.0f);
-                    float hue   = (atan2f(vy, vx) + 3.14159265f) / PI2 * 360.0f;
+                    float alpha = min(mag * invSens, 1.0f);
+                    float hue   = (atan2f(vy, vx) + 3.14159265f) * invPI2;
 
                     // HSV→BGR inline: S=1, V=1
                     float h6 = hue / 60.0f;
