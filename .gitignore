@@ -1,3 +1,9 @@
 dist/
+TimeMirror.app/
+TimeMirror.zip
 time_mirror_mac.zip
 time_mirror
+*.zip
+*.app/
+install.command
+.DS_Store

@@ -92,19 +92,6 @@ Mat   datamoshDiffF;          // CV_32FC3 scratch for the per-frame diff
 float datamoshDecay  = 0.92f; // IIR decay per frame (higher = longer trails)
 const float DATAMOSH_BOOST = 5.0f;  // diff amplification before accumulation
 
-// Scan Glitch mode settings
-struct GlitchBand {
-    int  frameOffset;  // frames back to pull from
-    bool active;       // currently glitched?
-    int  hShift;       // horizontal pixel shift (CRT jitter)
-};
-vector<GlitchBand> glitchBands;  // one entry per band row; pre-allocated to FRAME_HEIGHT
-int   glitchBandHeight = 4;      // rows per band (Up/Down adjustable)
-float glitchRate       = 0.12f;  // per-band activation probability per frame
-float glitchDecay      = 0.25f;  // per-band deactivation probability per frame
-bool  glitchFullFlicker = false;
-int   glitchFlickerFrame = 0;
-
 // Flow Ripple mode (J) — directional color that advects with optical flow and decays over ~1 second.
 // rippleBuffer holds accumulated per-pixel BGR color as float [0–255].
 // Each frame: advect with remap, decay by rippleDecay, inject new color where flow is strong.
@@ -114,6 +101,16 @@ Mat   rippleMapX;    // CV_32F,   backward-warp x coords built from flowMap
 Mat   rippleMapY;    // CV_32F,   backward-warp y coords built from flowMap
 Mat   ripple8;       // CV_8UC3,  converted for additive compositing
 float rippleDecay = 0.93f;  // per-frame IIR decay (~1s at 60fps: 0.93^60 ≈ 0.014)
+
+// Turbulence mode (T) — per-pixel motion history drives pixel displacement + color separation.
+// turbulenceMap accumulates motion over ~2 seconds via IIR decay.
+// Still areas → near grayscale. Active areas → vivid distortion with chromatic split.
+Mat           turbulenceMap;  // CV_32F, 0–1, accumulated per-pixel motion history
+vector<float> turbNoiseX;     // pre-allocated sinf lookup table, size = actualWidth
+vector<float> turbNoiseY;     // pre-allocated cosf lookup table, size = actualWidth
+int   turbFrame = 0;
+float turbDecay = 0.992f;     // IIR decay (~2s half-life at 60fps)
+float turbShift = 20.0f;      // max pixel displacement at full turbulence (Up/Down adjustable)
 
 // Main-thread-only state
 string currentMode = "s";
@@ -326,43 +323,6 @@ void applyTimeDisplacement(Mat& output, int width, int height, int bufIdx) {
         // Still areas: accum → 0 → black.  Moving areas: bright colour that decays over time.
         datamoshAccum.convertTo(output, CV_8UC3);
     }
-    else if (currentMode == "scanglitch") {
-        // Full-frame flicker: entire output jumps to a random old frame.
-        if (glitchFullFlicker) {
-            frameBuffer[glitchFlickerFrame].copyTo(output);
-            return;
-        }
-        int recent   = (bufIdx - 1 + BUFFER_SIZE * 2) % BUFFER_SIZE;
-        int numBands = max(1, height / glitchBandHeight);
-        // Parallelize at band level — each band's rows are independent.
-        #pragma omp parallel for schedule(static)
-        for (int b = 0; b < numBands; b++) {
-            int yStart = b * glitchBandHeight;
-            int yEnd   = min(yStart + glitchBandHeight, height);
-            if (glitchBands[b].active) {
-                int fi    = (bufIdx - 1 - glitchBands[b].frameOffset + BUFFER_SIZE * 2) % BUFFER_SIZE;
-                // Normalise shift to [0, width) once — avoids per-pixel modulo
-                int s = ((glitchBands[b].hShift % width) + width) % width;
-                for (int y = yStart; y < yEnd; y++) {
-                    const Vec3b* src = frameBuffer[fi].ptr<Vec3b>(y);
-                    Vec3b*       dst = output.ptr<Vec3b>(y);
-                    // Two memcpy segments replace the per-pixel index calculation
-                    if (s == 0) {
-                        memcpy(dst, src, width * sizeof(Vec3b));
-                    } else {
-                        memcpy(dst,           src + (width - s), s           * sizeof(Vec3b));
-                        memcpy(dst + s,       src,               (width - s) * sizeof(Vec3b));
-                    }
-                }
-            } else {
-                for (int y = yStart; y < yEnd; y++)
-                    frameBuffer[recent].row(y).copyTo(output.row(y));
-            }
-        }
-        // Fill any remainder rows (when height is not divisible by glitchBandHeight)
-        for (int y = numBands * glitchBandHeight; y < height; y++)
-            frameBuffer[recent].row(y).copyTo(output.row(y));
-    }
     else if (currentMode == "flowripple") {
         // rippleBuffer is maintained by the preprocessing block (advect + decay + inject).
         // Convert to 8-bit (saturating) and add additively over the current frame so
@@ -370,6 +330,58 @@ void applyTimeDisplacement(Mat& output, int width, int height, int bufIdx) {
         int recent = (bufIdx - 1 + BUFFER_SIZE * 2) % BUFFER_SIZE;
         rippleBuffer.convertTo(ripple8, CV_8UC3, 1.0);
         cv::add(frameBuffer[recent], ripple8, output);
+    }
+    else if (currentMode == "turbulence") {
+        // turbulenceMap is maintained by the preprocessing block.
+        // Per-pixel: turbulence level (0=still, 1=max) drives:
+        //   • animated sine-wave displacement (scaled by turbShift)
+        //   • chromatic split: B/G/R sampled from different x offsets
+        //   • saturation: 0 turbulence → grayscale, full → 2.5× vivid
+        // xNoiseX/Y are precomputed per frame to avoid trig in the inner loop.
+        int recent = (bufIdx - 1 + BUFFER_SIZE * 2) % BUFFER_SIZE;
+        float ta = turbFrame * 0.04f;
+        for (int x = 0; x < width; x++) {
+            turbNoiseX[x] = sinf(x * 0.04f + ta * 1.1f);
+            turbNoiseY[x] = cosf(x * 0.04f - ta * 0.7f);
+        }
+        #pragma omp parallel for schedule(static)
+        for (int y = 0; y < height; y++) {
+            float rowNX = cosf(y * 0.04f + ta * 0.6f);
+            float rowNY = sinf(y * 0.04f - ta * 0.8f);
+            const float* turbRow = turbulenceMap.ptr<float>(y);
+            Vec3b* outRow = output.ptr<Vec3b>(y);
+            for (int x = 0; x < width; x++) {
+                float t = turbRow[x];
+                if (t < 0.01f) {
+                    Vec3b pix = frameBuffer[recent].ptr<Vec3b>(y)[x];
+                    int g = (int)(0.114f * pix[0] + 0.587f * pix[1] + 0.299f * pix[2]);
+                    outRow[x] = Vec3b((uchar)g, (uchar)g, (uchar)g);
+                    continue;
+                }
+                float nx = (turbNoiseX[x] + rowNX) * 0.5f;
+                float ny = (turbNoiseY[x] + rowNY) * 0.5f;
+                int dx = (int)(nx * t * turbShift);
+                int dy = (int)(ny * t * turbShift);
+                // Each channel displaced in a different direction for vivid separation.
+                // B: push opposite to main displacement; R: amplified main direction;
+                // G: perpendicular. Spread scales with turbulence (max ~50px per channel).
+                float spread = t * 50.0f;
+                int sxB = max(0, min(x + dx - (int)(spread),        width  - 1));
+                int syB = max(0, min(y + dy + (int)(spread * 0.5f), height - 1));
+                int sxG = max(0, min(x + dx + (int)(spread * 0.3f), width  - 1));
+                int syG = max(0, min(y + dy - (int)(spread * 0.6f), height - 1));
+                int sxR = max(0, min(x + dx + (int)(spread),        width  - 1));
+                int syR = max(0, min(y + dy + (int)(spread * 0.4f), height - 1));
+                float B = frameBuffer[recent].ptr<Vec3b>(syB)[sxB][0];
+                float G = frameBuffer[recent].ptr<Vec3b>(syG)[sxG][1];
+                float R = frameBuffer[recent].ptr<Vec3b>(syR)[sxR][2];
+                float gray = 0.114f * B + 0.587f * G + 0.299f * R;
+                float satFactor = t * 2.5f;
+                outRow[x][0] = (uchar)max(0, min((int)(gray + (B - gray) * satFactor), 255));
+                outRow[x][1] = (uchar)max(0, min((int)(gray + (G - gray) * satFactor), 255));
+                outRow[x][2] = (uchar)max(0, min((int)(gray + (R - gray) * satFactor), 255));
+            }
+        }
     }
     else if (currentMode == "flowhue") {
         // Each pixel: hue = optical flow direction, saturation = flow speed,
@@ -426,8 +438,8 @@ string getModeName() {
     if (currentMode == "prismatic")  return "P: Prismatic Echo";
     if (currentMode == "flowhue")    return "H: Flow Direction Color";
     if (currentMode == "flowripple") return "J: Flow Color Ripple";
-    if (currentMode == "scanglitch") return "N: Scan Glitch";
     if (currentMode == "datamosh")   return "Y: Datamosh";
+    if (currentMode == "turbulence") return "N: Turbulence";
     return "Unknown";
 }
 
@@ -512,8 +524,10 @@ int main() {
     rippleMapY   = Mat::zeros(actualHeight, actualWidth, CV_32F);
     ripple8      = Mat::zeros(actualHeight, actualWidth, CV_8UC3);
 
-    // Pre-allocate scan glitch band state (one entry per row, worst case band height = 1)
-    glitchBands.assign(actualHeight, {0, false, 0});
+    // Pre-allocate turbulence mode buffers
+    turbulenceMap = Mat::zeros(actualHeight, actualWidth, CV_32F);
+    turbNoiseX.assign(actualWidth, 0.0f);
+    turbNoiseY.assign(actualWidth, 0.0f);
 
     namedWindow("Time Mirror Effect", WINDOW_NORMAL);
     resizeWindow("Time Mirror Effect", 1280, 720);
@@ -527,8 +541,9 @@ int main() {
     cout << "  P            - Prismatic echo (6 hue-tinted temporal echoes)"         << endl;
     cout << "  H            - Flow direction color (direction→hue, speed→saturation)" << endl;
     cout << "  J            - Flow color ripple (directional color that lingers and drifts)" << endl;
-    cout << "  N            - Scan glitch (CRT band corruption + flicker)"           << endl;
+    cout << "  N            - Turbulence (motion history → displacement + chroma + saturation)" << endl;
     cout << "  Y            - Datamosh (motion trails via IIR diff accumulation)"    << endl;
+    cout << "  T            - Turbulence (motion history → displacement + chroma + saturation)" << endl;
     cout << "  Up/Down      - Speed / Chroma / Flow sens / Spread / Echo / Band ht" << endl;
     cout << "  R            - Reset the above to defaults"     << endl;
     cout << "  F            - Toggle fullscreen"               << endl;
@@ -581,27 +596,23 @@ int main() {
                             datamoshDiffF, DATAMOSH_BOOST, 0.0, datamoshAccum);
         }
 
-        // Update scan glitch band state — used by scanglitch mode.
-        // Full-frame flicker and per-band activation/decay are probabilistic.
-        // This runs serially before the OpenMP render so the parallel loop only reads.
-        if (currentMode == "scanglitch") {
-            glitchFullFlicker = (rand() % 100) < 3;
-            if (glitchFullFlicker) {
-                glitchFlickerFrame = (bufIdx - 1 - (rand() % BUFFER_SIZE) + BUFFER_SIZE * 2) % BUFFER_SIZE;
-            }
-            int numBands = max(1, actualHeight / glitchBandHeight);
-            for (int b = 0; b < numBands; b++) {
-                if (glitchBands[b].active) {
-                    if ((rand() % 100) < (int)(glitchDecay * 100))
-                        glitchBands[b].active = false;
-                } else {
-                    if ((rand() % 100) < (int)(glitchRate * 100)) {
-                        glitchBands[b].active      = true;
-                        glitchBands[b].frameOffset = 1 + rand() % (BUFFER_SIZE - 1);
-                        glitchBands[b].hShift      = (rand() % 121) - 60;  // −60…+60 px
-                    }
-                }
-            }
+        // Update turbulence accumulator — used by turbulence mode.
+        // Diffs current vs MOTION_LOOKBACK frames ago, blurs spatially, then IIR-decays
+        // into turbulenceMap. Still areas fade to 0 over ~2s; motion spikes quickly to 1.
+        if (currentMode == "turbulence") {
+            int recent = (bufIdx - 1               + BUFFER_SIZE * 2) % BUFFER_SIZE;
+            int older  = (bufIdx - 1 - MOTION_LOOKBACK + BUFFER_SIZE * 2) % BUFFER_SIZE;
+            cv::absdiff(frameBuffer[recent], frameBuffer[older], diffMat);
+            cv::cvtColor(diffMat, grayDiff, COLOR_BGR2GRAY);
+            cv::resize(grayDiff, motionSmall, motionSmall.size(), 0, 0, INTER_LINEAR);
+            cv::GaussianBlur(motionSmall, motionSmall, Size(MOTION_BLUR_SIZE, MOTION_BLUR_SIZE), 0);
+            cv::resize(motionSmall, grayDiff, grayDiff.size(), 0, 0, INTER_LINEAR);
+            cv::threshold(grayDiff, grayDiff, 20, 255, THRESH_TOZERO);  // suppress camera noise
+            grayDiff.convertTo(motionMap, CV_32F, 0.5 / 255.0);  // reuse motionMap as scratch
+            turbulenceMap *= turbDecay;
+            cv::add(turbulenceMap, motionMap, turbulenceMap);
+            cv::min(turbulenceMap, 1.0f, turbulenceMap);
+            turbFrame++;
         }
 
         // Compute optical flow — used by flowhue and flowripple modes.
@@ -720,7 +731,12 @@ int main() {
             rippleBuffer.setTo(0);   // clear lingering state on entry
             cout << "Mode: " << getModeName() << endl;
         }
-        else if (key == 'n') { currentMode = "scanglitch"; cout << "Mode: " << getModeName() << endl; }
+        else if (key == 'n') {
+            currentMode = "turbulence";
+            turbulenceMap.setTo(0);
+            turbFrame = 0;
+            cout << "Mode: " << getModeName() << endl;
+        }
         else if (key == 'y') {
             currentMode = "datamosh";
             datamoshAccum.setTo(0);  // fresh slate each entry
@@ -745,15 +761,15 @@ int main() {
             } else if (currentMode == "prismatic") {
                 echoSpacing = 15;
                 overlayText = "Echo: " + to_string(echoSpacing);
-            } else if (currentMode == "scanglitch") {
-                glitchBandHeight = 4;
-                overlayText = "Band: " + to_string(glitchBandHeight);
             } else if (currentMode == "datamosh") {
                 datamoshDecay = 0.92f;
                 overlayText = "Trail: " + to_string((int)(datamoshDecay * 100));
             } else if (currentMode == "flowripple") {
                 rippleDecay = 0.93f;
                 overlayText = "Persist: " + to_string((int)(rippleDecay * 100));
+            } else if (currentMode == "turbulence") {
+                turbShift = 20.0f;
+                overlayText = "Shift: " + to_string((int)turbShift);
             } else {
                 updateSpeed.store(1);
                 overlayText = "Speed: 1";
@@ -775,15 +791,15 @@ int main() {
             } else if (currentMode == "prismatic") {
                 echoSpacing = min(BUFFER_SIZE / 6 - 1, echoSpacing + 2);
                 overlayText = "Echo: " + to_string(echoSpacing);
-            } else if (currentMode == "scanglitch") {
-                glitchBandHeight = min(64, glitchBandHeight + 1);
-                overlayText = "Band: " + to_string(glitchBandHeight);
             } else if (currentMode == "datamosh") {
                 datamoshDecay = min(0.98f, datamoshDecay + 0.02f);
                 overlayText = "Trail: " + to_string((int)(datamoshDecay * 100));
             } else if (currentMode == "flowripple") {
                 rippleDecay = min(0.99f, rippleDecay + 0.01f);
                 overlayText = "Persist: " + to_string((int)(rippleDecay * 100));
+            } else if (currentMode == "turbulence") {
+                turbShift = min(60.0f, turbShift + 2.0f);
+                overlayText = "Shift: " + to_string((int)turbShift);
             } else {
                 updateSpeed.store(min(BUFFER_SIZE, updateSpeed.load() + 1));
                 overlayText = "Speed: " + to_string(updateSpeed.load());
@@ -805,15 +821,15 @@ int main() {
             } else if (currentMode == "prismatic") {
                 echoSpacing = max(1, echoSpacing - 2);
                 overlayText = "Echo: " + to_string(echoSpacing);
-            } else if (currentMode == "scanglitch") {
-                glitchBandHeight = max(1, glitchBandHeight - 1);
-                overlayText = "Band: " + to_string(glitchBandHeight);
             } else if (currentMode == "datamosh") {
                 datamoshDecay = max(0.70f, datamoshDecay - 0.02f);
                 overlayText = "Trail: " + to_string((int)(datamoshDecay * 100));
             } else if (currentMode == "flowripple") {
                 rippleDecay = max(0.70f, rippleDecay - 0.01f);
                 overlayText = "Persist: " + to_string((int)(rippleDecay * 100));
+            } else if (currentMode == "turbulence") {
+                turbShift = max(2.0f, turbShift - 2.0f);
+                overlayText = "Shift: " + to_string((int)turbShift);
             } else {
                 updateSpeed.store(max(1, updateSpeed.load() - 1));
                 overlayText = "Speed: " + to_string(updateSpeed.load());
