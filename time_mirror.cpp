@@ -41,28 +41,30 @@ using namespace std;
 using namespace chrono;
 
 // Configuration
-const int FRAME_WIDTH  = 1920;
+const int FRAME_WIDTH = 1920;
 const int FRAME_HEIGHT = 1080;
-const int BUFFER_SIZE  = 200;
+const int BUFFER_SIZE = 200;
 
 // Motion mode settings
-const int MOTION_LOOKBACK  = 10;  // Frames back for motion comparison (higher = reacts to slower motion)
-const int MOTION_BLUR_SIZE = 31;  // Spatial blur radius — larger spreads halos further (must be odd)
+const int MOTION_LOOKBACK = 10;  // Frames back for motion comparison (higher = reacts to slower motion)
+const int MOTION_BLUR_SIZE = 31; // Spatial blur radius — larger spreads halos further (must be odd)
 
 // Chromatic time shift settings (runtime-adjustable with Up/Down in chroma mode)
-int chromaOffset = 8;  // Frames between each colour channel (B=now, G=now-N, R=now-2N)
+int chromaOffset = 23; // Frames between each colour channel (B=now, G=now-N, R=now-2N)
+
+// Motion adaptive mode settings (runtime-adjustable with Up/Down in motion mode)
+int motionMaxOffset = 40; // Max frames back at full motion (higher = more dreamy, lower = subtle)
 
 // Motion-chromatic mode settings (runtime-adjustable with Up/Down in mchroma mode)
-int chromaSpread = 20; // Max frames between channels at full motion (0-motion = no split)
-
+int chromaSpread = 40; // Max frames between channels at full motion (0-motion = no split)
 
 // Shared between capture thread and main thread.
 // writeIndex uses release/acquire semantics so the main thread always
 // sees a fully-written frame before the index advances past it.
-vector<Mat>      frameBuffer;
-atomic<int>      writeIndex{0};
-atomic<int>      updateSpeed{1};
-atomic<bool>     running{true};
+vector<Mat> frameBuffer;
+atomic<int> writeIndex{0};
+atomic<int> updateSpeed{1};
+atomic<bool> running{true};
 
 // Motion mode working buffers — pre-allocated in main, used only in main thread
 Mat motionMap;   // CV_32F, 0.0 (still) → 1.0 (max motion), per-pixel
@@ -71,46 +73,46 @@ Mat grayDiff;    // CV_8U  scratch for grayscale + blur
 Mat motionSmall; // CV_8U  scratch for motion blur at FLOW_SCALE resolution
 
 // Prismatic echo settings (runtime-adjustable with Up/Down in prismatic mode)
-int echoSpacing = 15;  // Frames between each of 6 hue-tinted echoes (1 – BUFFER_SIZE/6)
+int echoSpacing = 23; // Frames between each of 6 hue-tinted echoes (1 – BUFFER_SIZE/3)
 
 // Optical flow mode working buffers — pre-allocated in main
 // Flow is computed at FLOW_SCALE of full resolution for performance, then resized up.
-const float FLOW_SCALE = 0.25f;  // compute flow at 1/4 linear resolution (~16x fewer pixels)
-Mat   flowMap;        // CV_32FC2, full-size interpolated flow vectors (vx, vy)
-Mat   smallFlowBuf;   // CV_32FC2, flow at reduced resolution
-Mat   smallPrevBGR;   // downscaled previous frame for flow input
-Mat   smallCurrBGR;   // downscaled current frame for flow input
-Mat   prevGraySmall;  // grayscale at small scale
-Mat   currGraySmall;  // grayscale at small scale
+const float FLOW_SCALE = 0.25f; // compute flow at 1/4 linear resolution (~16x fewer pixels)
+Mat flowMap;                    // CV_32FC2, full-size interpolated flow vectors (vx, vy)
+Mat smallFlowBuf;               // CV_32FC2, flow at reduced resolution
+Mat smallPrevBGR;               // downscaled previous frame for flow input
+Mat smallCurrBGR;               // downscaled current frame for flow input
+Mat prevGraySmall;              // grayscale at small scale
+Mat currGraySmall;              // grayscale at small scale
 float flowSensitivity = 10.0f;  // flow px/frame (small-scale) that maps to full time offset
 
 // Datamosh mode settings
 // Accumulates per-pixel frame differences with IIR decay.
 // Still areas → black; motion → vivid color trails that persist then fade.
-Mat   datamoshAccum;          // CV_32FC3, signed accumulator
-Mat   datamoshDiffF;          // CV_32FC3 scratch for the per-frame diff
-float datamoshDecay  = 0.92f; // IIR decay per frame (higher = longer trails)
-const float DATAMOSH_BOOST = 5.0f;  // diff amplification before accumulation
+Mat datamoshAccum;                 // CV_32FC3, signed accumulator
+Mat datamoshDiffF;                 // CV_32FC3 scratch for the per-frame diff
+float datamoshDecay = 0.92f;       // IIR decay per frame (higher = longer trails)
+const float DATAMOSH_BOOST = 5.0f; // diff amplification before accumulation
 
 // Flow Ripple mode (J) — directional color that advects with optical flow and decays over ~1 second.
 // rippleBuffer holds accumulated per-pixel BGR color as float [0–255].
 // Each frame: advect with remap, decay by rippleDecay, inject new color where flow is strong.
-Mat   rippleBuffer;  // CV_32FC3, full res, persists between frames
-Mat   rippleTmp;     // CV_32FC3, scratch for remap output
-Mat   rippleMapX;    // CV_32F,   backward-warp x coords built from flowMap
-Mat   rippleMapY;    // CV_32F,   backward-warp y coords built from flowMap
-Mat   ripple8;       // CV_8UC3,  converted for additive compositing
-float rippleDecay = 0.93f;  // per-frame IIR decay (~1s at 60fps: 0.93^60 ≈ 0.014)
+Mat rippleBuffer;          // CV_32FC3, full res, persists between frames
+Mat rippleTmp;             // CV_32FC3, scratch for remap output
+Mat rippleMapX;            // CV_32F,   backward-warp x coords built from flowMap
+Mat rippleMapY;            // CV_32F,   backward-warp y coords built from flowMap
+Mat ripple8;               // CV_8UC3,  converted for additive compositing
+float rippleDecay = 0.93f; // per-frame IIR decay (~1s at 60fps: 0.93^60 ≈ 0.014)
 
 // Turbulence mode (T) — per-pixel motion history drives pixel displacement + color separation.
 // turbulenceMap accumulates motion over ~2 seconds via IIR decay.
 // Still areas → near grayscale. Active areas → vivid distortion with chromatic split.
-Mat           turbulenceMap;  // CV_32F, 0–1, accumulated per-pixel motion history
-vector<float> turbNoiseX;     // pre-allocated sinf lookup table, size = actualWidth
-vector<float> turbNoiseY;     // pre-allocated cosf lookup table, size = actualWidth
-int   turbFrame = 0;
-float turbDecay = 0.992f;     // IIR decay (~2s half-life at 60fps)
-float turbShift = 20.0f;      // max pixel displacement at full turbulence (Up/Down adjustable)
+Mat turbulenceMap;        // CV_32F, 0–1, accumulated per-pixel motion history
+vector<float> turbNoiseX; // pre-allocated sinf lookup table, size = actualWidth
+vector<float> turbNoiseY; // pre-allocated cosf lookup table, size = actualWidth
+int turbFrame = 0;
+float turbDecay = 0.992f; // IIR decay (~2s half-life at 60fps)
+float turbShift = 20.0f;  // max pixel displacement at full turbulence (Up/Down adjustable)
 
 // Main-thread-only state
 string currentMode = "s";
@@ -119,21 +121,28 @@ const double COMBO_WINDOW = 0.5;
 
 // ── Capture thread ────────────────────────────────────────────────────────────
 // Runs independently so cap >> frame never stalls the render loop.
-void captureLoop(VideoCapture& cap) {
+void captureLoop(VideoCapture &cap)
+{
     Mat frame;
-    while (running) {
+    while (running)
+    {
         cap >> frame;
-        if (frame.empty()) { running = false; break; }
+        if (frame.empty())
+        {
+            running = false;
+            break;
+        }
 
         flip(frame, frame, 1);
 
         // Write the captured frame once, then copy from the warm slot for
         // subsequent speed steps — avoids re-reading the source frame from memory.
         int speed = updateSpeed.load(memory_order_relaxed);
-        int idx   = writeIndex.load(memory_order_relaxed);
+        int idx = writeIndex.load(memory_order_relaxed);
         frame.copyTo(frameBuffer[idx]);
         writeIndex.store((idx + 1) % BUFFER_SIZE, memory_order_release);
-        for (int i = 1; i < speed; i++) {
+        for (int i = 1; i < speed; i++)
+        {
             int prev = idx;
             idx = writeIndex.load(memory_order_relaxed);
             frameBuffer[prev].copyTo(frameBuffer[idx]);
@@ -143,23 +152,30 @@ void captureLoop(VideoCapture& cap) {
 }
 
 // ── Key combo detection ───────────────────────────────────────────────────────
-string checkForCombo(char keyPressed) {
+string checkForCombo(char keyPressed)
+{
     auto currentTime = steady_clock::now();
     lastKeyTime[keyPressed] = currentTime;
 
-    if (keyPressed == 'w' || keyPressed == 's') {
+    if (keyPressed == 'w' || keyPressed == 's')
+    {
         char other = (keyPressed == 'w') ? 's' : 'w';
-        if (lastKeyTime.count(other)) {
+        if (lastKeyTime.count(other))
+        {
             double dt = duration<double>(currentTime - lastKeyTime[other]).count();
-            if (dt < COMBO_WINDOW) return "ws";
+            if (dt < COMBO_WINDOW)
+                return "ws";
         }
         return string(1, keyPressed);
     }
-    if (keyPressed == 'a' || keyPressed == 'd') {
+    if (keyPressed == 'a' || keyPressed == 'd')
+    {
         char other = (keyPressed == 'a') ? 'd' : 'a';
-        if (lastKeyTime.count(other)) {
+        if (lastKeyTime.count(other))
+        {
             double dt = duration<double>(currentTime - lastKeyTime[other]).count();
-            if (dt < COMBO_WINDOW) return "ad";
+            if (dt < COMBO_WINDOW)
+                return "ad";
         }
         return string(1, keyPressed);
     }
@@ -174,97 +190,116 @@ string checkForCombo(char keyPressed) {
 // OpenMP parallelises the per-row / per-column loops across all cores.
 // Each iteration is independent (different row/col of output), so there are
 // no data races.
-void applyTimeDisplacement(Mat& output, int width, int height, int bufIdx) {
-    if (currentMode == "ws") {
+void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
+{
+    if (currentMode == "ws")
+    {
         int centerY = height / 2;
-        #pragma omp parallel for schedule(static)
-        for (int y = 0; y < height; y++) {
+#pragma omp parallel for schedule(static)
+        for (int y = 0; y < height; y++)
+        {
             int dist = abs(y - centerY);
             int frameOffset = (bufIdx - 1 - (dist * BUFFER_SIZE / max(centerY, 1)) + BUFFER_SIZE * 2) % BUFFER_SIZE;
             frameBuffer[frameOffset].row(y).copyTo(output.row(y));
         }
     }
-    else if (currentMode == "ad") {
+    else if (currentMode == "ad")
+    {
         int centerX = width / 2;
         // Precompute frame index per column, then copy row-by-row (cache-friendly)
         vector<int> colFrame(width);
-        for (int x = 0; x < width; x++) {
+        for (int x = 0; x < width; x++)
+        {
             int dist = abs(x - centerX);
             colFrame[x] = (bufIdx - 1 - (dist * BUFFER_SIZE / max(centerX, 1)) + BUFFER_SIZE * 2) % BUFFER_SIZE;
         }
-        #pragma omp parallel for schedule(static)
-        for (int y = 0; y < height; y++) {
-            Vec3b* outRow = output.ptr<Vec3b>(y);
+#pragma omp parallel for schedule(static)
+        for (int y = 0; y < height; y++)
+        {
+            Vec3b *outRow = output.ptr<Vec3b>(y);
             for (int x = 0; x < width; x++)
                 outRow[x] = frameBuffer[colFrame[x]].ptr<Vec3b>(y)[x];
         }
     }
-    else if (currentMode == "w") {
-        #pragma omp parallel for schedule(static)
-        for (int y = 0; y < height; y++) {
+    else if (currentMode == "w")
+    {
+#pragma omp parallel for schedule(static)
+        for (int y = 0; y < height; y++)
+        {
             int frameOffset = (bufIdx - ((height - 1 - y) * BUFFER_SIZE / height) + BUFFER_SIZE) % BUFFER_SIZE;
             frameBuffer[frameOffset].row(y).copyTo(output.row(y));
         }
     }
-    else if (currentMode == "s") {
-        #pragma omp parallel for schedule(static)
-        for (int y = 0; y < height; y++) {
+    else if (currentMode == "s")
+    {
+#pragma omp parallel for schedule(static)
+        for (int y = 0; y < height; y++)
+        {
             int frameOffset = (bufIdx - (y * BUFFER_SIZE / height) + BUFFER_SIZE) % BUFFER_SIZE;
             frameBuffer[frameOffset].row(y).copyTo(output.row(y));
         }
     }
-    else if (currentMode == "a") {
+    else if (currentMode == "a")
+    {
         vector<int> colFrame(width);
         for (int x = 0; x < width; x++)
             colFrame[x] = (bufIdx - ((width - 1 - x) * BUFFER_SIZE / width) + BUFFER_SIZE) % BUFFER_SIZE;
-        #pragma omp parallel for schedule(static)
-        for (int y = 0; y < height; y++) {
-            Vec3b* outRow = output.ptr<Vec3b>(y);
+#pragma omp parallel for schedule(static)
+        for (int y = 0; y < height; y++)
+        {
+            Vec3b *outRow = output.ptr<Vec3b>(y);
             for (int x = 0; x < width; x++)
                 outRow[x] = frameBuffer[colFrame[x]].ptr<Vec3b>(y)[x];
         }
     }
-    else if (currentMode == "d") {
+    else if (currentMode == "d")
+    {
         vector<int> colFrame(width);
         for (int x = 0; x < width; x++)
             colFrame[x] = (bufIdx - (x * BUFFER_SIZE / width) + BUFFER_SIZE) % BUFFER_SIZE;
-        #pragma omp parallel for schedule(static)
-        for (int y = 0; y < height; y++) {
-            Vec3b* outRow = output.ptr<Vec3b>(y);
+#pragma omp parallel for schedule(static)
+        for (int y = 0; y < height; y++)
+        {
+            Vec3b *outRow = output.ptr<Vec3b>(y);
             for (int x = 0; x < width; x++)
                 outRow[x] = frameBuffer[colFrame[x]].ptr<Vec3b>(y)[x];
         }
     }
-    else if (currentMode == "motion") {
-        // Per-pixel: still areas sample the current frame, moving areas sample
-        // further back in time — motion creates long temporal trails.
-        // motionMap must be computed by the caller before this function.
-        #pragma omp parallel for schedule(static)
-        for (int y = 0; y < height; y++) {
-            const float* motionRow = motionMap.ptr<float>(y);
-            Vec3b*       outRow    = output.ptr<Vec3b>(y);
-            for (int x = 0; x < width; x++) {
+    else if (currentMode == "motion")
+    {
+// Per-pixel: still areas sample the current frame, moving areas sample
+// further back in time — motion creates long temporal trails.
+// motionMap must be computed by the caller before this function.
+#pragma omp parallel for schedule(static)
+        for (int y = 0; y < height; y++)
+        {
+            const float *motionRow = motionMap.ptr<float>(y);
+            Vec3b *outRow = output.ptr<Vec3b>(y);
+            for (int x = 0; x < width; x++)
+            {
                 // motion=0 → bufIdx-1 (most recent); motion=1 → bufIdx (oldest)
-                int offset = (int)(motionRow[x] * (BUFFER_SIZE - 1));
-                int idx    = (bufIdx - 1 - offset + BUFFER_SIZE * 2) % BUFFER_SIZE;
-                outRow[x]  = frameBuffer[idx].ptr<Vec3b>(y)[x];
+                int offset = (int)(motionRow[x] * motionMaxOffset);
+                int idx = (bufIdx - 1 - offset + BUFFER_SIZE * 2) % BUFFER_SIZE;
+                outRow[x] = frameBuffer[idx].ptr<Vec3b>(y)[x];
             }
         }
     }
-    else if (currentMode == "chroma") {
+    else if (currentMode == "chroma")
+    {
         // B channel from most recent frame, G from CHROMA_OFFSET frames ago,
         // R from 2×CHROMA_OFFSET frames ago. Still objects look normal; moving
         // objects leave blue→green→red colour trails.
         // mixChannels does this in a single pass with no intermediate allocations.
-        int idx0 = (bufIdx - 1                      + BUFFER_SIZE * 2) % BUFFER_SIZE;
-        int idx1 = (bufIdx - 1 - chromaOffset       + BUFFER_SIZE * 2) % BUFFER_SIZE;
-        int idx2 = (bufIdx - 1 - chromaOffset * 2   + BUFFER_SIZE * 2) % BUFFER_SIZE;
+        int idx0 = (bufIdx - 1 + BUFFER_SIZE * 2) % BUFFER_SIZE;
+        int idx1 = (bufIdx - 1 - chromaOffset + BUFFER_SIZE * 2) % BUFFER_SIZE;
+        int idx2 = (bufIdx - 1 - chromaOffset * 2 + BUFFER_SIZE * 2) % BUFFER_SIZE;
 
-        const Mat sources[] = { frameBuffer[idx0], frameBuffer[idx1], frameBuffer[idx2] };
-        const int fromTo[]  = { 0,0,  4,1,  8,2 };  // B←frame0, G←frame1, R←frame2
+        const Mat sources[] = {frameBuffer[idx0], frameBuffer[idx1], frameBuffer[idx2]};
+        const int fromTo[] = {0, 0, 4, 1, 8, 2}; // B←frame0, G←frame1, R←frame2
         cv::mixChannels(sources, 3, &output, 1, fromTo, 3);
     }
-    else if (currentMode == "mchroma") {
+    else if (currentMode == "mchroma")
+    {
         // Per-pixel motion-adaptive chromatic aberration.
         // Still pixels (motion=0) show the current frame unchanged.
         // Moving pixels get B/G/R channels pulled from progressively older frames,
@@ -272,22 +307,25 @@ void applyTimeDisplacement(Mat& output, int width, int height, int bufIdx) {
         // motionMap must be computed by the caller before this function.
         // idxB is constant for the whole frame — hoist out of both loops
         int idxB = (bufIdx - 1 + BUFFER_SIZE * 2) % BUFFER_SIZE;
-        #pragma omp parallel for schedule(static)
-        for (int y = 0; y < height; y++) {
-            const float* motionRow = motionMap.ptr<float>(y);
-            Vec3b*       outRow    = output.ptr<Vec3b>(y);
-            const Vec3b* rowB      = frameBuffer[idxB].ptr<Vec3b>(y);
-            for (int x = 0; x < width; x++) {
+#pragma omp parallel for schedule(static)
+        for (int y = 0; y < height; y++)
+        {
+            const float *motionRow = motionMap.ptr<float>(y);
+            Vec3b *outRow = output.ptr<Vec3b>(y);
+            const Vec3b *rowB = frameBuffer[idxB].ptr<Vec3b>(y);
+            for (int x = 0; x < width; x++)
+            {
                 int spread = (int)(motionRow[x] * chromaSpread);
-                int idxG = (bufIdx - 1 - spread   + BUFFER_SIZE * 2) % BUFFER_SIZE;
-                int idxR = (bufIdx - 1 - spread*2  + BUFFER_SIZE * 4) % BUFFER_SIZE;
-                outRow[x][0] = rowB[x][0];                                           // B ← newest
-                outRow[x][1] = frameBuffer[idxG].ptr<Vec3b>(y)[x][1];  // G ← spread ago
-                outRow[x][2] = frameBuffer[idxR].ptr<Vec3b>(y)[x][2];  // R ← 2× spread ago
+                int idxG = (bufIdx - 1 - spread + BUFFER_SIZE * 2) % BUFFER_SIZE;
+                int idxR = (bufIdx - 1 - spread * 2 + BUFFER_SIZE * 4) % BUFFER_SIZE;
+                outRow[x][0] = rowB[x][0];                            // B ← newest
+                outRow[x][1] = frameBuffer[idxG].ptr<Vec3b>(y)[x][1]; // G ← spread ago
+                outRow[x][2] = frameBuffer[idxR].ptr<Vec3b>(y)[x][2]; // R ← 2× spread ago
             }
         }
     }
-    else if (currentMode == "prismatic") {
+    else if (currentMode == "prismatic")
+    {
         // 6 temporal echoes, each tinted with an evenly-spaced hue (red→yellow→green→
         // cyan→blue→magenta). Echoes are additively combined per channel.
         // Still areas: all echoes overlap → image reproduces faithfully.
@@ -301,29 +339,33 @@ void applyTimeDisplacement(Mat& output, int width, int height, int bufIdx) {
         int fi[6];
         for (int e = 0; e < 6; e++)
             fi[e] = (bufIdx - 1 - e * echoSpacing + BUFFER_SIZE * 4) % BUFFER_SIZE;
-        #pragma omp parallel for schedule(static)
-        for (int y = 0; y < height; y++) {
-            const Vec3b* src[6];
+#pragma omp parallel for schedule(static)
+        for (int y = 0; y < height; y++)
+        {
+            const Vec3b *src[6];
             for (int e = 0; e < 6; e++)
                 src[e] = frameBuffer[fi[e]].ptr<Vec3b>(y);
-            Vec3b* outRow = output.ptr<Vec3b>(y);
-            for (int x = 0; x < width; x++) {
+            Vec3b *outRow = output.ptr<Vec3b>(y);
+            for (int x = 0; x < width; x++)
+            {
                 float sumR = src[0][x][2] + src[1][x][2] + src[5][x][2];
                 float sumG = src[1][x][1] + src[2][x][1] + src[3][x][1];
                 float sumB = src[3][x][0] + src[4][x][0] + src[5][x][0];
-                outRow[x][0] = (uchar)min(255.0f, sumB * (1.0f/3.0f));
-                outRow[x][1] = (uchar)min(255.0f, sumG * (1.0f/3.0f));
-                outRow[x][2] = (uchar)min(255.0f, sumR * (1.0f/3.0f));
+                outRow[x][0] = (uchar)min(255.0f, sumB * (1.0f / 3.0f));
+                outRow[x][1] = (uchar)min(255.0f, sumG * (1.0f / 3.0f));
+                outRow[x][2] = (uchar)min(255.0f, sumR * (1.0f / 3.0f));
             }
         }
     }
-    else if (currentMode == "datamosh") {
+    else if (currentMode == "datamosh")
+    {
         // datamoshAccum is a CV_32FC3 float buffer updated by the preprocessing block.
         // convertTo with CV_8UC3 saturates values above 255 to 255 — no manual clamping needed.
         // Still areas: accum → 0 → black.  Moving areas: bright colour that decays over time.
         datamoshAccum.convertTo(output, CV_8UC3);
     }
-    else if (currentMode == "flowripple") {
+    else if (currentMode == "flowripple")
+    {
         // rippleBuffer is maintained by the preprocessing block (advect + decay + inject).
         // Convert to 8-bit (saturating) and add additively over the current frame so
         // still areas show the live video and moving areas glow with directional ripple color.
@@ -331,7 +373,8 @@ void applyTimeDisplacement(Mat& output, int width, int height, int bufIdx) {
         rippleBuffer.convertTo(ripple8, CV_8UC3, 1.0);
         cv::add(frameBuffer[recent], ripple8, output);
     }
-    else if (currentMode == "turbulence") {
+    else if (currentMode == "turbulence")
+    {
         // turbulenceMap is maintained by the preprocessing block.
         // Per-pixel: turbulence level (0=still, 1=max) drives:
         //   • animated sine-wave displacement (scaled by turbShift)
@@ -340,19 +383,23 @@ void applyTimeDisplacement(Mat& output, int width, int height, int bufIdx) {
         // xNoiseX/Y are precomputed per frame to avoid trig in the inner loop.
         int recent = (bufIdx - 1 + BUFFER_SIZE * 2) % BUFFER_SIZE;
         float ta = turbFrame * 0.04f;
-        for (int x = 0; x < width; x++) {
+        for (int x = 0; x < width; x++)
+        {
             turbNoiseX[x] = sinf(x * 0.04f + ta * 1.1f);
             turbNoiseY[x] = cosf(x * 0.04f - ta * 0.7f);
         }
-        #pragma omp parallel for schedule(static)
-        for (int y = 0; y < height; y++) {
+#pragma omp parallel for schedule(static)
+        for (int y = 0; y < height; y++)
+        {
             float rowNX = cosf(y * 0.04f + ta * 0.6f);
             float rowNY = sinf(y * 0.04f - ta * 0.8f);
-            const float* turbRow = turbulenceMap.ptr<float>(y);
-            Vec3b* outRow = output.ptr<Vec3b>(y);
-            for (int x = 0; x < width; x++) {
+            const float *turbRow = turbulenceMap.ptr<float>(y);
+            Vec3b *outRow = output.ptr<Vec3b>(y);
+            for (int x = 0; x < width; x++)
+            {
                 float t = turbRow[x];
-                if (t < 0.01f) {
+                if (t < 0.01f)
+                {
                     Vec3b pix = frameBuffer[recent].ptr<Vec3b>(y)[x];
                     int g = (int)(0.114f * pix[0] + 0.587f * pix[1] + 0.299f * pix[2]);
                     outRow[x] = Vec3b((uchar)g, (uchar)g, (uchar)g);
@@ -366,11 +413,11 @@ void applyTimeDisplacement(Mat& output, int width, int height, int bufIdx) {
                 // B: push opposite to main displacement; R: amplified main direction;
                 // G: perpendicular. Spread scales with turbulence (max ~50px per channel).
                 float spread = t * 50.0f;
-                int sxB = max(0, min(x + dx - (int)(spread),        width  - 1));
+                int sxB = max(0, min(x + dx - (int)(spread), width - 1));
                 int syB = max(0, min(y + dy + (int)(spread * 0.5f), height - 1));
-                int sxG = max(0, min(x + dx + (int)(spread * 0.3f), width  - 1));
+                int sxG = max(0, min(x + dx + (int)(spread * 0.3f), width - 1));
                 int syG = max(0, min(y + dy - (int)(spread * 0.6f), height - 1));
-                int sxR = max(0, min(x + dx + (int)(spread),        width  - 1));
+                int sxR = max(0, min(x + dx + (int)(spread), width - 1));
                 int syR = max(0, min(y + dy + (int)(spread * 0.4f), height - 1));
                 float B = frameBuffer[recent].ptr<Vec3b>(syB)[sxB][0];
                 float G = frameBuffer[recent].ptr<Vec3b>(syG)[sxG][1];
@@ -383,7 +430,8 @@ void applyTimeDisplacement(Mat& output, int width, int height, int bufIdx) {
             }
         }
     }
-    else if (currentMode == "flowhue") {
+    else if (currentMode == "flowhue")
+    {
         // Each pixel: hue = optical flow direction, saturation = flow speed,
         // value = pixel brightness from current frame.
         // Still areas → grayscale. Moving areas → vivid directional colour:
@@ -391,80 +439,125 @@ void applyTimeDisplacement(Mat& output, int width, int height, int bufIdx) {
         // flowMap must be computed by the caller before this function.
         const float PI2 = 2.0f * 3.14159265f;
         int recent = (bufIdx - 1 + BUFFER_SIZE * 2) % BUFFER_SIZE;
-        #pragma omp parallel for schedule(static)
-        for (int y = 0; y < height; y++) {
-            const Vec2f* flowRow = flowMap.ptr<Vec2f>(y);
-            const Vec3b* srcRow  = frameBuffer[recent].ptr<Vec3b>(y);
-            Vec3b* outRow = output.ptr<Vec3b>(y);
-            for (int x = 0; x < width; x++) {
-                float vx  = flowRow[x][0];
-                float vy  = flowRow[x][1];
-                float mag = sqrtf(vx*vx + vy*vy);
+#pragma omp parallel for schedule(static)
+        for (int y = 0; y < height; y++)
+        {
+            const Vec2f *flowRow = flowMap.ptr<Vec2f>(y);
+            const Vec3b *srcRow = frameBuffer[recent].ptr<Vec3b>(y);
+            Vec3b *outRow = output.ptr<Vec3b>(y);
+            for (int x = 0; x < width; x++)
+            {
+                float vx = flowRow[x][0];
+                float vy = flowRow[x][1];
+                float mag = sqrtf(vx * vx + vy * vy);
                 float sat = min(mag / flowSensitivity, 1.0f);
                 Vec3b pix = srcRow[x];
-                float val = (pix[0]*0.114f + pix[1]*0.587f + pix[2]*0.299f) * (1.0f/255.0f);
+                float val = (pix[0] * 0.114f + pix[1] * 0.587f + pix[2] * 0.299f) * (1.0f / 255.0f);
                 float hue = (atan2f(vy, vx) + 3.14159265f) / PI2 * 360.0f;
-                float c   = val * sat;
-                float h6  = hue / 60.0f;
-                float xc  = c * (1.0f - fabsf(fmodf(h6, 2.0f) - 1.0f));
-                float m   = val - c;
+                float c = val * sat;
+                float h6 = hue / 60.0f;
+                float xc = c * (1.0f - fabsf(fmodf(h6, 2.0f) - 1.0f));
+                float m = val - c;
                 float rp, gp, bp;
-                switch ((int)h6 % 6) {
-                    case 0: rp=c;  gp=xc; bp=0;  break;
-                    case 1: rp=xc; gp=c;  bp=0;  break;
-                    case 2: rp=0;  gp=c;  bp=xc; break;
-                    case 3: rp=0;  gp=xc; bp=c;  break;
-                    case 4: rp=xc; gp=0;  bp=c;  break;
-                    default:rp=c;  gp=0;  bp=xc; break;
+                switch ((int)h6 % 6)
+                {
+                case 0:
+                    rp = c;
+                    gp = xc;
+                    bp = 0;
+                    break;
+                case 1:
+                    rp = xc;
+                    gp = c;
+                    bp = 0;
+                    break;
+                case 2:
+                    rp = 0;
+                    gp = c;
+                    bp = xc;
+                    break;
+                case 3:
+                    rp = 0;
+                    gp = xc;
+                    bp = c;
+                    break;
+                case 4:
+                    rp = xc;
+                    gp = 0;
+                    bp = c;
+                    break;
+                default:
+                    rp = c;
+                    gp = 0;
+                    bp = xc;
+                    break;
                 }
-                outRow[x][0] = (uchar)((bp+m)*255.0f);
-                outRow[x][1] = (uchar)((gp+m)*255.0f);
-                outRow[x][2] = (uchar)((rp+m)*255.0f);
+                outRow[x][0] = (uchar)((bp + m) * 255.0f);
+                outRow[x][1] = (uchar)((gp + m) * 255.0f);
+                outRow[x][2] = (uchar)((rp + m) * 255.0f);
             }
         }
     }
 }
 
-string getModeName() {
-    if (currentMode == "w")  return "W: Bottom to Top";
-    if (currentMode == "s")  return "S: Top to Bottom";
-    if (currentMode == "a")  return "A: Right to Left";
-    if (currentMode == "d")  return "D: Left to Right";
-    if (currentMode == "ws")     return "W+S: Center-Out Vertical";
-    if (currentMode == "ad")     return "A+D: Center-Out Horizontal";
-    if (currentMode == "motion")  return "M: Motion Adaptive";
-    if (currentMode == "chroma")  return "C: Chromatic Time Shift";
-    if (currentMode == "mchroma")    return "X: Motion Chromatic";
-    if (currentMode == "prismatic")  return "P: Prismatic Echo";
-    if (currentMode == "flowhue")    return "H: Flow Direction Color";
-    if (currentMode == "flowripple") return "J: Flow Color Ripple";
-    if (currentMode == "datamosh")   return "Y: Datamosh";
-    if (currentMode == "turbulence") return "N: Turbulence";
+string getModeName()
+{
+    if (currentMode == "w")
+        return "W: Bottom to Top";
+    if (currentMode == "s")
+        return "S: Top to Bottom";
+    if (currentMode == "a")
+        return "A: Right to Left";
+    if (currentMode == "d")
+        return "D: Left to Right";
+    if (currentMode == "ws")
+        return "W+S: Center-Out Vertical";
+    if (currentMode == "ad")
+        return "A+D: Center-Out Horizontal";
+    if (currentMode == "motion")
+        return "M: Motion Adaptive";
+    if (currentMode == "chroma")
+        return "C: Chromatic Time Shift";
+    if (currentMode == "mchroma")
+        return "X: Motion Chromatic";
+    if (currentMode == "prismatic")
+        return "P: Prismatic Echo";
+    if (currentMode == "flowhue")
+        return "H: Flow Direction Color";
+    if (currentMode == "flowripple")
+        return "J: Flow Color Ripple";
+    if (currentMode == "datamosh")
+        return "Y: Datamosh";
+    if (currentMode == "turbulence")
+        return "N: Turbulence";
     return "Unknown";
 }
 
-void drawValueOverlay(Mat& output, const string& text, double timeSinceChange) {
+void drawValueOverlay(Mat &output, const string &text, double timeSinceChange)
+{
     const double DISPLAY_DURATION = 3.0;
-    const double FADE_DURATION    = 0.5;
-    if (timeSinceChange > DISPLAY_DURATION) return;
+    const double FADE_DURATION = 0.5;
+    if (timeSinceChange > DISPLAY_DURATION)
+        return;
 
     string speedText = text;
-    int    fontFace  = FONT_HERSHEY_SIMPLEX;
+    int fontFace = FONT_HERSHEY_SIMPLEX;
     double fontScale = 1.5;
-    int    thickness = 3;
-    int    baseline  = 0;
-    Size   textSize  = getTextSize(speedText, fontFace, fontScale, thickness, &baseline);
+    int thickness = 3;
+    int baseline = 0;
+    Size textSize = getTextSize(speedText, fontFace, fontScale, thickness, &baseline);
 
-    int   padding = 40;
+    int padding = 40;
     Point textPos(output.cols - textSize.width - padding, output.rows - padding);
     putText(output, speedText, textPos, fontFace, fontScale, Scalar(255, 255, 255), thickness);
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
-int main() {
+int main()
+{
     cout << "========================================" << endl;
-    cout << "Time Mirror Effect - C++ Version"        << endl;
-    cout << "High Performance Implementation"         << endl;
+    cout << "Time Mirror Effect - C++ Version" << endl;
+    cout << "High Performance Implementation" << endl;
 #ifdef _OPENMP
     cout << "OpenMP enabled (" << omp_get_max_threads() << " threads)" << endl;
 #else
@@ -473,14 +566,18 @@ int main() {
     cout << "========================================" << endl;
 
     VideoCapture cap(0);
-    if (!cap.isOpened()) { cerr << "ERROR: Cannot open camera" << endl; return -1; }
+    if (!cap.isOpened())
+    {
+        cerr << "ERROR: Cannot open camera" << endl;
+        return -1;
+    }
 
-    cap.set(CAP_PROP_FRAME_WIDTH,  FRAME_WIDTH);
+    cap.set(CAP_PROP_FRAME_WIDTH, FRAME_WIDTH);
     cap.set(CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT);
-    cap.set(CAP_PROP_FPS,          60);
-    cap.set(CAP_PROP_BUFFERSIZE,   1);   // Always grab the freshest frame
+    cap.set(CAP_PROP_FPS, 60);
+    cap.set(CAP_PROP_BUFFERSIZE, 1); // Always grab the freshest frame
 
-    int actualWidth  = cap.get(CAP_PROP_FRAME_WIDTH);
+    int actualWidth = cap.get(CAP_PROP_FRAME_WIDTH);
     int actualHeight = cap.get(CAP_PROP_FRAME_HEIGHT);
     cout << "Camera initialized: " << actualWidth << "x" << actualHeight << endl;
     if (actualWidth != FRAME_WIDTH || actualHeight != FRAME_HEIGHT)
@@ -498,20 +595,20 @@ int main() {
 
     // Pre-allocate motion mode working buffers
     motionMap = Mat::zeros(actualHeight, actualWidth, CV_32F);
-    diffMat   = Mat::zeros(actualHeight, actualWidth, CV_8UC3);
-    grayDiff  = Mat::zeros(actualHeight, actualWidth, CV_8U);
+    diffMat = Mat::zeros(actualHeight, actualWidth, CV_8UC3);
+    grayDiff = Mat::zeros(actualHeight, actualWidth, CV_8U);
 
     // Pre-allocate optical flow working buffers (computed at reduced resolution)
-    int flowW = max(1, (int)(actualWidth  * FLOW_SCALE));
+    int flowW = max(1, (int)(actualWidth * FLOW_SCALE));
     int flowH = max(1, (int)(actualHeight * FLOW_SCALE));
-    flowMap       = Mat::zeros(actualHeight, actualWidth, CV_32FC2);
-    smallFlowBuf  = Mat::zeros(flowH, flowW, CV_32FC2);
-    smallPrevBGR  = Mat::zeros(flowH, flowW, CV_8UC3);
-    smallCurrBGR  = Mat::zeros(flowH, flowW, CV_8UC3);
+    flowMap = Mat::zeros(actualHeight, actualWidth, CV_32FC2);
+    smallFlowBuf = Mat::zeros(flowH, flowW, CV_32FC2);
+    smallPrevBGR = Mat::zeros(flowH, flowW, CV_8UC3);
+    smallCurrBGR = Mat::zeros(flowH, flowW, CV_8UC3);
     prevGraySmall = Mat::zeros(flowH, flowW, CV_8U);
     currGraySmall = Mat::zeros(flowH, flowW, CV_8U);
-    motionSmall   = Mat::zeros(flowH, flowW, CV_8U);
-    cout << "Flow buffers: " << flowW << "x" << flowH << " (1/" << (int)(1/FLOW_SCALE) << " scale)" << endl;
+    motionSmall = Mat::zeros(flowH, flowW, CV_8U);
+    cout << "Flow buffers: " << flowW << "x" << flowH << " (1/" << (int)(1 / FLOW_SCALE) << " scale)" << endl;
 
     // Pre-allocate datamosh working buffers
     datamoshAccum = Mat::zeros(actualHeight, actualWidth, CV_32FC3);
@@ -519,10 +616,10 @@ int main() {
 
     // Pre-allocate flow ripple working buffers
     rippleBuffer = Mat::zeros(actualHeight, actualWidth, CV_32FC3);
-    rippleTmp    = Mat::zeros(actualHeight, actualWidth, CV_32FC3);
-    rippleMapX   = Mat::zeros(actualHeight, actualWidth, CV_32F);
-    rippleMapY   = Mat::zeros(actualHeight, actualWidth, CV_32F);
-    ripple8      = Mat::zeros(actualHeight, actualWidth, CV_8UC3);
+    rippleTmp = Mat::zeros(actualHeight, actualWidth, CV_32FC3);
+    rippleMapX = Mat::zeros(actualHeight, actualWidth, CV_32F);
+    rippleMapY = Mat::zeros(actualHeight, actualWidth, CV_32F);
+    ripple8 = Mat::zeros(actualHeight, actualWidth, CV_8UC3);
 
     // Pre-allocate turbulence mode buffers
     turbulenceMap = Mat::zeros(actualHeight, actualWidth, CV_32F);
@@ -532,23 +629,24 @@ int main() {
     namedWindow("Time Mirror Effect", WINDOW_NORMAL);
     resizeWindow("Time Mirror Effect", 1280, 720);
 
-    cout << "\nKEYBOARD CONTROLS:"                              << endl;
-    cout << "  W/S/A/D      - Direction controls"              << endl;
+    cout << "\nKEYBOARD CONTROLS:" << endl;
+    cout << "  W/S/A/D      - Direction controls" << endl;
     cout << "  W+S or A+D   - Combo modes (press within 0.5s)" << endl;
-    cout << "  M            - Motion adaptive mode"            << endl;
-    cout << "  C            - Chromatic time shift mode"       << endl;
+    cout << "  M            - Motion adaptive mode" << endl;
+    cout << "  C            - Chromatic time shift mode" << endl;
     cout << "  X            - Motion chromatic (still=normal, moving=RGB time split)" << endl;
-    cout << "  P            - Prismatic echo (6 hue-tinted temporal echoes)"         << endl;
+    cout << "  P            - Prismatic echo (6 hue-tinted temporal echoes)" << endl;
     cout << "  H            - Flow direction color (direction→hue, speed→saturation)" << endl;
     cout << "  J            - Flow color ripple (directional color that lingers and drifts)" << endl;
     cout << "  N            - Turbulence (motion history → displacement + chroma + saturation)" << endl;
-    cout << "  Y            - Datamosh (motion trails via IIR diff accumulation)"    << endl;
+    cout << "  Y            - Datamosh (motion trails via IIR diff accumulation)" << endl;
     cout << "  T            - Turbulence (motion history → displacement + chroma + saturation)" << endl;
     cout << "  Up/Down      - Speed / Chroma / Flow sens / Spread / Echo / Band ht" << endl;
-    cout << "  R            - Reset the above to defaults"     << endl;
-    cout << "  F            - Toggle fullscreen"               << endl;
-    cout << "  Q/ESC        - Quit"                            << endl;
-    cout << "\nStarting...\n"                                   << endl;
+    cout << "  R            - Reset the above to defaults" << endl;
+    cout << "  F            - Toggle fullscreen" << endl;
+    cout << "  Q/ESC        - Quit" << endl;
+    cout << "\nStarting...\n"
+         << endl;
 
     // Start capture thread — decouples camera I/O from render loop
     thread captureThread(captureLoop, ref(cap));
@@ -557,23 +655,25 @@ int main() {
     while (writeIndex.load(memory_order_acquire) == 0 && running)
         this_thread::sleep_for(milliseconds(10));
 
-    double fps          = 0;
-    auto   fpsStartTime = steady_clock::now();
-    int    fpsFrameCount = 0;
-    bool   isFullscreen  = false;
+    double fps = 0;
+    auto fpsStartTime = steady_clock::now();
+    int fpsFrameCount = 0;
+    bool isFullscreen = false;
 
-    auto   lastOverlayTime = steady_clock::now();
-    bool   overlayActive   = false;
+    auto lastOverlayTime = steady_clock::now();
+    bool overlayActive = false;
     string overlayText;
 
-    while (running) {
+    while (running)
+    {
         // acquire: see all frameBuffer writes that happened before this index
         int bufIdx = writeIndex.load(memory_order_acquire);
 
         // Build motion map — used by motion and mchroma modes
-        if (currentMode == "motion" || currentMode == "mchroma") {
-            int recent = (bufIdx - 1               + BUFFER_SIZE * 2) % BUFFER_SIZE;
-            int older  = (bufIdx - 1 - MOTION_LOOKBACK + BUFFER_SIZE * 2) % BUFFER_SIZE;
+        if (currentMode == "motion" || currentMode == "mchroma")
+        {
+            int recent = (bufIdx - 1 + BUFFER_SIZE * 2) % BUFFER_SIZE;
+            int older = (bufIdx - 1 - MOTION_LOOKBACK + BUFFER_SIZE * 2) % BUFFER_SIZE;
             cv::absdiff(frameBuffer[recent], frameBuffer[older], diffMat);
             cv::cvtColor(diffMat, grayDiff, COLOR_BGR2GRAY);
             // Blur at FLOW_SCALE resolution (~16× fewer pixels) then upsample
@@ -587,7 +687,8 @@ int main() {
         // absdiff(current, previous) gives per-pixel color change; accumulated with
         // IIR decay so motion leaves bright trails that fade over time.
         // Reuses diffMat (CV_8UC3) scratch buffer already declared for motion mode.
-        if (currentMode == "datamosh") {
+        if (currentMode == "datamosh")
+        {
             int curr = (bufIdx - 1 + BUFFER_SIZE * 2) % BUFFER_SIZE;
             int prev = (bufIdx - 2 + BUFFER_SIZE * 2) % BUFFER_SIZE;
             cv::absdiff(frameBuffer[curr], frameBuffer[prev], diffMat);
@@ -599,16 +700,17 @@ int main() {
         // Update turbulence accumulator — used by turbulence mode.
         // Diffs current vs MOTION_LOOKBACK frames ago, blurs spatially, then IIR-decays
         // into turbulenceMap. Still areas fade to 0 over ~2s; motion spikes quickly to 1.
-        if (currentMode == "turbulence") {
-            int recent = (bufIdx - 1               + BUFFER_SIZE * 2) % BUFFER_SIZE;
-            int older  = (bufIdx - 1 - MOTION_LOOKBACK + BUFFER_SIZE * 2) % BUFFER_SIZE;
+        if (currentMode == "turbulence")
+        {
+            int recent = (bufIdx - 1 + BUFFER_SIZE * 2) % BUFFER_SIZE;
+            int older = (bufIdx - 1 - MOTION_LOOKBACK + BUFFER_SIZE * 2) % BUFFER_SIZE;
             cv::absdiff(frameBuffer[recent], frameBuffer[older], diffMat);
             cv::cvtColor(diffMat, grayDiff, COLOR_BGR2GRAY);
             cv::resize(grayDiff, motionSmall, motionSmall.size(), 0, 0, INTER_LINEAR);
             cv::GaussianBlur(motionSmall, motionSmall, Size(MOTION_BLUR_SIZE, MOTION_BLUR_SIZE), 0);
             cv::resize(motionSmall, grayDiff, grayDiff.size(), 0, 0, INTER_LINEAR);
-            cv::threshold(grayDiff, grayDiff, 20, 255, THRESH_TOZERO);  // suppress camera noise
-            grayDiff.convertTo(motionMap, CV_32F, 0.5 / 255.0);  // reuse motionMap as scratch
+            cv::threshold(grayDiff, grayDiff, 20, 255, THRESH_TOZERO); // suppress camera noise
+            grayDiff.convertTo(motionMap, CV_32F, 0.5 / 255.0);        // reuse motionMap as scratch
             turbulenceMap *= turbDecay;
             cv::add(turbulenceMap, motionMap, turbulenceMap);
             cv::min(turbulenceMap, 1.0f, turbulenceMap);
@@ -617,10 +719,11 @@ int main() {
 
         // Compute optical flow — used by flowhue and flowripple modes.
         // Farneback runs at FLOW_SCALE resolution then is resized up for speed.
-        if (currentMode == "flowhue" || currentMode == "flowripple") {
+        if (currentMode == "flowhue" || currentMode == "flowripple")
+        {
             int recent = (bufIdx - 1 + BUFFER_SIZE * 2) % BUFFER_SIZE;
-            int older  = (bufIdx - 2 + BUFFER_SIZE * 2) % BUFFER_SIZE;
-            cv::resize(frameBuffer[older],  smallPrevBGR, smallPrevBGR.size());
+            int older = (bufIdx - 2 + BUFFER_SIZE * 2) % BUFFER_SIZE;
+            cv::resize(frameBuffer[older], smallPrevBGR, smallPrevBGR.size());
             cv::resize(frameBuffer[recent], smallCurrBGR, smallCurrBGR.size());
             cv::cvtColor(smallPrevBGR, prevGraySmall, COLOR_BGR2GRAY);
             cv::cvtColor(smallCurrBGR, currGraySmall, COLOR_BGR2GRAY);
@@ -634,18 +737,21 @@ int main() {
         // 2. remap advects existing color content forward (in the flow direction).
         // 3. Decay: multiply by rippleDecay (~1 second lifetime at 60fps).
         // 4. Inject: where flow is strong, add a fresh saturated directional color additively.
-        if (currentMode == "flowripple") {
-            const float PI2     = 2.0f * 3.14159265f;
+        if (currentMode == "flowripple")
+        {
+            const float PI2 = 2.0f * 3.14159265f;
             const float invSens = 1.0f / flowSensitivity;
-            const float invPI2  = 360.0f / PI2;
+            const float invPI2 = 360.0f / PI2;
 
-            // Step 1: build backward-warp maps (pixel at (x,y) came from (x-vx, y-vy))
-            #pragma omp parallel for schedule(static)
-            for (int y = 0; y < actualHeight; y++) {
-                const Vec2f* flowRow = flowMap.ptr<Vec2f>(y);
-                float* mx = rippleMapX.ptr<float>(y);
-                float* my = rippleMapY.ptr<float>(y);
-                for (int x = 0; x < actualWidth; x++) {
+// Step 1: build backward-warp maps (pixel at (x,y) came from (x-vx, y-vy))
+#pragma omp parallel for schedule(static)
+            for (int y = 0; y < actualHeight; y++)
+            {
+                const Vec2f *flowRow = flowMap.ptr<Vec2f>(y);
+                float *mx = rippleMapX.ptr<float>(y);
+                float *my = rippleMapY.ptr<float>(y);
+                for (int x = 0; x < actualWidth; x++)
+                {
                     mx[x] = (float)x - flowRow[x][0];
                     my[x] = (float)y - flowRow[x][1];
                 }
@@ -658,31 +764,59 @@ int main() {
             // Step 3: decay
             rippleTmp *= rippleDecay;
 
-            // Step 4: inject fresh directional color where motion exceeds threshold
-            #pragma omp parallel for schedule(static)
-            for (int y = 0; y < actualHeight; y++) {
-                const Vec2f* flowRow = flowMap.ptr<Vec2f>(y);
-                Vec3f*       ripRow  = rippleTmp.ptr<Vec3f>(y);
-                for (int x = 0; x < actualWidth; x++) {
-                    float vx  = flowRow[x][0];
-                    float vy  = flowRow[x][1];
-                    float mag = sqrtf(vx*vx + vy*vy);
-                    if (mag < 0.5f) continue;
+// Step 4: inject fresh directional color where motion exceeds threshold
+#pragma omp parallel for schedule(static)
+            for (int y = 0; y < actualHeight; y++)
+            {
+                const Vec2f *flowRow = flowMap.ptr<Vec2f>(y);
+                Vec3f *ripRow = rippleTmp.ptr<Vec3f>(y);
+                for (int x = 0; x < actualWidth; x++)
+                {
+                    float vx = flowRow[x][0];
+                    float vy = flowRow[x][1];
+                    float mag = sqrtf(vx * vx + vy * vy);
+                    if (mag < 0.5f)
+                        continue;
 
                     float alpha = min(mag * invSens, 1.0f);
-                    float hue   = (atan2f(vy, vx) + 3.14159265f) * invPI2;
+                    float hue = (atan2f(vy, vx) + 3.14159265f) * invPI2;
 
                     // HSV→BGR inline: S=1, V=1
                     float h6 = hue / 60.0f;
                     float xc = 1.0f - fabsf(fmodf(h6, 2.0f) - 1.0f);
                     float rp, gp, bp;
-                    switch ((int)h6 % 6) {
-                        case 0: rp=1.f; gp=xc;  bp=0;   break;
-                        case 1: rp=xc;  gp=1.f;  bp=0;   break;
-                        case 2: rp=0;   gp=1.f;  bp=xc;  break;
-                        case 3: rp=0;   gp=xc;   bp=1.f; break;
-                        case 4: rp=xc;  gp=0;    bp=1.f; break;
-                        default:rp=1.f; gp=0;    bp=xc;  break;
+                    switch ((int)h6 % 6)
+                    {
+                    case 0:
+                        rp = 1.f;
+                        gp = xc;
+                        bp = 0;
+                        break;
+                    case 1:
+                        rp = xc;
+                        gp = 1.f;
+                        bp = 0;
+                        break;
+                    case 2:
+                        rp = 0;
+                        gp = 1.f;
+                        bp = xc;
+                        break;
+                    case 3:
+                        rp = 0;
+                        gp = xc;
+                        bp = 1.f;
+                        break;
+                    case 4:
+                        rp = xc;
+                        gp = 0;
+                        bp = 1.f;
+                        break;
+                    default:
+                        rp = 1.f;
+                        gp = 0;
+                        bp = xc;
+                        break;
                     }
 
                     float brightness = alpha * 255.0f;
@@ -698,145 +832,255 @@ int main() {
         applyTimeDisplacement(output, actualWidth, actualHeight, bufIdx);
 
         // FPS
-        if (++fpsFrameCount >= 10) {
+        if (++fpsFrameCount >= 10)
+        {
             auto now = steady_clock::now();
             fps = fpsFrameCount / duration<double>(now - fpsStartTime).count();
-            fpsStartTime  = now;
+            fpsStartTime = now;
             fpsFrameCount = 0;
             cout << "FPS: " << (int)fps << " | Mode: " << getModeName() << endl;
         }
 
-        if (overlayActive) {
+        if (overlayActive)
+        {
             double dt = duration<double>(steady_clock::now() - lastOverlayTime).count();
             drawValueOverlay(output, overlayText, dt);
-            if (dt > 3.0) overlayActive = false;
+            if (dt > 3.0)
+                overlayActive = false;
         }
 
         imshow("Time Mirror Effect", output);
 
         int key = waitKey(1);
-        if (key == 'q' || key == 27) { running = false; break; }
+        if (key == 'q' || key == 27)
+        {
+            running = false;
+            break;
+        }
 
-        if      (key == 'w') { currentMode = checkForCombo('w'); cout << "Mode: " << getModeName() << endl; }
-        else if (key == 's') { currentMode = checkForCombo('s'); cout << "Mode: " << getModeName() << endl; }
-        else if (key == 'a') { currentMode = checkForCombo('a'); cout << "Mode: " << getModeName() << endl; }
-        else if (key == 'd') { currentMode = checkForCombo('d'); cout << "Mode: " << getModeName() << endl; }
-        else if (key == 'm') { currentMode = "motion";           cout << "Mode: " << getModeName() << endl; }
-        else if (key == 'c') { currentMode = "chroma";           cout << "Mode: " << getModeName() << endl; }
-        else if (key == 'x') { currentMode = "mchroma";   cout << "Mode: " << getModeName() << endl; }
-        else if (key == 'p') { currentMode = "prismatic"; cout << "Mode: " << getModeName() << endl; }
-        else if (key == 'h') { currentMode = "flowhue";    cout << "Mode: " << getModeName() << endl; }
-        else if (key == 'j') {
-            currentMode = "flowripple";
-            rippleBuffer.setTo(0);   // clear lingering state on entry
+        if (key == 'w')
+        {
+            currentMode = checkForCombo('w');
             cout << "Mode: " << getModeName() << endl;
         }
-        else if (key == 'n') {
+        else if (key == 's')
+        {
+            currentMode = checkForCombo('s');
+            cout << "Mode: " << getModeName() << endl;
+        }
+        else if (key == 'a')
+        {
+            currentMode = checkForCombo('a');
+            cout << "Mode: " << getModeName() << endl;
+        }
+        else if (key == 'd')
+        {
+            currentMode = checkForCombo('d');
+            cout << "Mode: " << getModeName() << endl;
+        }
+        else if (key == 'm')
+        {
+            currentMode = "motion";
+            cout << "Mode: " << getModeName() << endl;
+        }
+        else if (key == 'c')
+        {
+            currentMode = "chroma";
+            cout << "Mode: " << getModeName() << endl;
+        }
+        else if (key == 'x')
+        {
+            currentMode = "mchroma";
+            cout << "Mode: " << getModeName() << endl;
+        }
+        else if (key == 'p')
+        {
+            currentMode = "prismatic";
+            cout << "Mode: " << getModeName() << endl;
+        }
+        else if (key == 'h')
+        {
+            currentMode = "flowhue";
+            cout << "Mode: " << getModeName() << endl;
+        }
+        else if (key == 'j')
+        {
+            currentMode = "flowripple";
+            rippleBuffer.setTo(0); // clear lingering state on entry
+            cout << "Mode: " << getModeName() << endl;
+        }
+        else if (key == 'n')
+        {
             currentMode = "turbulence";
             turbulenceMap.setTo(0);
             turbFrame = 0;
             cout << "Mode: " << getModeName() << endl;
         }
-        else if (key == 'y') {
+        else if (key == 'y')
+        {
             currentMode = "datamosh";
-            datamoshAccum.setTo(0);  // fresh slate each entry
+            datamoshAccum.setTo(0); // fresh slate each entry
             cout << "Mode: " << getModeName() << endl;
         }
-        else if (key == 'f') {
+        else if (key == 'f')
+        {
             isFullscreen = !isFullscreen;
             setWindowProperty("Time Mirror Effect", WND_PROP_FULLSCREEN,
                               isFullscreen ? WINDOW_FULLSCREEN : WINDOW_NORMAL);
             cout << "Fullscreen: " << (isFullscreen ? "ON" : "OFF") << endl;
         }
-        else if (key == 'r') {
-            if (currentMode == "chroma") {
-                chromaOffset = 8;
-                overlayText  = "Chroma: " + to_string(chromaOffset);
-            } else if (currentMode == "flowhue") {
+        else if (key == 'r')
+        {
+            if (currentMode == "motion")
+            {
+                motionMaxOffset = 40;
+                overlayText = "Depth: " + to_string(motionMaxOffset);
+            }
+            else if (currentMode == "chroma")
+            {
+                chromaOffset = 23;
+                overlayText = "Chroma: " + to_string(chromaOffset);
+            }
+            else if (currentMode == "flowhue")
+            {
                 flowSensitivity = 10.0f;
-                overlayText     = "Flow: " + to_string((int)flowSensitivity);
-            } else if (currentMode == "mchroma") {
-                chromaSpread = 20;
-                overlayText  = "Spread: " + to_string(chromaSpread);
-            } else if (currentMode == "prismatic") {
-                echoSpacing = 15;
+                overlayText = "Flow: " + to_string((int)flowSensitivity);
+            }
+            else if (currentMode == "mchroma")
+            {
+                chromaSpread = 40;
+                overlayText = "Spread: " + to_string(chromaSpread);
+            }
+            else if (currentMode == "prismatic")
+            {
+                echoSpacing = 23;
                 overlayText = "Echo: " + to_string(echoSpacing);
-            } else if (currentMode == "datamosh") {
+            }
+            else if (currentMode == "datamosh")
+            {
                 datamoshDecay = 0.92f;
                 overlayText = "Trail: " + to_string((int)(datamoshDecay * 100));
-            } else if (currentMode == "flowripple") {
+            }
+            else if (currentMode == "flowripple")
+            {
                 rippleDecay = 0.93f;
                 overlayText = "Persist: " + to_string((int)(rippleDecay * 100));
-            } else if (currentMode == "turbulence") {
+            }
+            else if (currentMode == "turbulence")
+            {
                 turbShift = 20.0f;
                 overlayText = "Shift: " + to_string((int)turbShift);
-            } else {
+            }
+            else
+            {
                 updateSpeed.store(1);
                 overlayText = "Speed: 1";
             }
             cout << overlayText << endl;
             lastOverlayTime = steady_clock::now();
-            overlayActive   = true;
+            overlayActive = true;
         }
-        else if (key == 0) {  // Up arrow (Mac)
-            if (currentMode == "chroma") {
+        else if (key == 0)
+        { // Up arrow (Mac)
+            if (currentMode == "motion")
+            {
+                motionMaxOffset = min(BUFFER_SIZE - 1, motionMaxOffset + 5);
+                overlayText = "Depth: " + to_string(motionMaxOffset);
+            }
+            else if (currentMode == "chroma")
+            {
                 chromaOffset = min(BUFFER_SIZE / 2 - 1, chromaOffset + 1);
-                overlayText  = "Chroma: " + to_string(chromaOffset);
-            } else if (currentMode == "flowhue") {
+                overlayText = "Chroma: " + to_string(chromaOffset);
+            }
+            else if (currentMode == "flowhue")
+            {
                 flowSensitivity = min(50.0f, flowSensitivity + 2.0f);
-                overlayText     = "Flow: " + to_string((int)flowSensitivity);
-            } else if (currentMode == "mchroma") {
+                overlayText = "Flow: " + to_string((int)flowSensitivity);
+            }
+            else if (currentMode == "mchroma")
+            {
                 chromaSpread = min(BUFFER_SIZE / 2 - 1, chromaSpread + 2);
-                overlayText  = "Spread: " + to_string(chromaSpread);
-            } else if (currentMode == "prismatic") {
-                echoSpacing = min(BUFFER_SIZE / 6 - 1, echoSpacing + 2);
+                overlayText = "Spread: " + to_string(chromaSpread);
+            }
+            else if (currentMode == "prismatic")
+            {
+                echoSpacing = min(BUFFER_SIZE / 3, echoSpacing + 2);
                 overlayText = "Echo: " + to_string(echoSpacing);
-            } else if (currentMode == "datamosh") {
+            }
+            else if (currentMode == "datamosh")
+            {
                 datamoshDecay = min(0.98f, datamoshDecay + 0.02f);
                 overlayText = "Trail: " + to_string((int)(datamoshDecay * 100));
-            } else if (currentMode == "flowripple") {
+            }
+            else if (currentMode == "flowripple")
+            {
                 rippleDecay = min(0.99f, rippleDecay + 0.01f);
                 overlayText = "Persist: " + to_string((int)(rippleDecay * 100));
-            } else if (currentMode == "turbulence") {
+            }
+            else if (currentMode == "turbulence")
+            {
                 turbShift = min(60.0f, turbShift + 2.0f);
                 overlayText = "Shift: " + to_string((int)turbShift);
-            } else {
+            }
+            else
+            {
                 updateSpeed.store(min(BUFFER_SIZE, updateSpeed.load() + 1));
                 overlayText = "Speed: " + to_string(updateSpeed.load());
             }
             cout << overlayText << endl;
             lastOverlayTime = steady_clock::now();
-            overlayActive   = true;
+            overlayActive = true;
         }
-        else if (key == 1) {  // Down arrow (Mac)
-            if (currentMode == "chroma") {
+        else if (key == 1)
+        { // Down arrow (Mac)
+            if (currentMode == "motion")
+            {
+                motionMaxOffset = max(5, motionMaxOffset - 5);
+                overlayText = "Depth: " + to_string(motionMaxOffset);
+            }
+            else if (currentMode == "chroma")
+            {
                 chromaOffset = max(1, chromaOffset - 1);
-                overlayText  = "Chroma: " + to_string(chromaOffset);
-            } else if (currentMode == "flowhue") {
+                overlayText = "Chroma: " + to_string(chromaOffset);
+            }
+            else if (currentMode == "flowhue")
+            {
                 flowSensitivity = max(2.0f, flowSensitivity - 2.0f);
-                overlayText     = "Flow: " + to_string((int)flowSensitivity);
-            } else if (currentMode == "mchroma") {
+                overlayText = "Flow: " + to_string((int)flowSensitivity);
+            }
+            else if (currentMode == "mchroma")
+            {
                 chromaSpread = max(1, chromaSpread - 2);
-                overlayText  = "Spread: " + to_string(chromaSpread);
-            } else if (currentMode == "prismatic") {
+                overlayText = "Spread: " + to_string(chromaSpread);
+            }
+            else if (currentMode == "prismatic")
+            {
                 echoSpacing = max(1, echoSpacing - 2);
                 overlayText = "Echo: " + to_string(echoSpacing);
-            } else if (currentMode == "datamosh") {
+            }
+            else if (currentMode == "datamosh")
+            {
                 datamoshDecay = max(0.70f, datamoshDecay - 0.02f);
                 overlayText = "Trail: " + to_string((int)(datamoshDecay * 100));
-            } else if (currentMode == "flowripple") {
+            }
+            else if (currentMode == "flowripple")
+            {
                 rippleDecay = max(0.70f, rippleDecay - 0.01f);
                 overlayText = "Persist: " + to_string((int)(rippleDecay * 100));
-            } else if (currentMode == "turbulence") {
+            }
+            else if (currentMode == "turbulence")
+            {
                 turbShift = max(2.0f, turbShift - 2.0f);
                 overlayText = "Shift: " + to_string((int)turbShift);
-            } else {
+            }
+            else
+            {
                 updateSpeed.store(max(1, updateSpeed.load() - 1));
                 overlayText = "Speed: " + to_string(updateSpeed.load());
             }
             cout << overlayText << endl;
             lastOverlayTime = steady_clock::now();
-            overlayActive   = true;
+            overlayActive = true;
         }
     }
 
