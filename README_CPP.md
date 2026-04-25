@@ -78,7 +78,7 @@ Produces `TimeMirror_notarized.zip` — trusted by Gatekeeper on any Mac.
 | **G** | Temporal Ghost | 7 person silhouettes at different moments in time, on black |
 | **K** | Rainbow Ghost | Like G but each echo tinted a cycling hue; color flows newest→oldest |
 
-> **G and K modes** require `seg_server.py` and MediaPipe to be installed for person segmentation.
+> **G and K modes** use Apple's Vision framework (built into macOS 12+) — no Python or MediaPipe required.
 
 ### Other Controls
 

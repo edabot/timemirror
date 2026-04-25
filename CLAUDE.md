@@ -102,7 +102,7 @@ This project captures live webcam footage and applies a time-displacement effect
 - **P** - Prismatic Echo (6 spectral echoes spaced through the buffer; moving subjects leave rainbow trails)
 - **H** - Flow Direction Color (optical flow direction → hue, magnitude → saturation; directional color from motion)
 - **N** - Turbulence (motion history accumulation drives pixel displacement + chroma split + saturation boost)
-- **G** - Temporal Ghost (7 neural-segmented person echoes through time on black; requires seg_server.py)
+- **G** - Temporal Ghost (7 person echoes through time on black; uses Apple Vision framework, no Python needed)
 - **K** - Rainbow Ghost (like G but each echo tinted a cycling hue; color flows newest→oldest; no temporal fade)
 
 ### Controls
@@ -149,10 +149,10 @@ cd /path/to/project
 brew install libomp
 g++ -std=c++17 -O3 -march=native -Xpreprocessor -fopenmp \
   -I$(brew --prefix libomp)/include -L$(brew --prefix libomp)/lib -lomp \
-  time_mirror.cpp -o time_mirror `pkg-config --cflags --libs opencv4`
+  time_mirror.mm -o time_mirror `pkg-config --cflags --libs opencv4`
 
 # Without OpenMP (still benefits from -O3 and capture thread)
-g++ -std=c++17 -O3 -march=native time_mirror.cpp -o time_mirror `pkg-config --cflags --libs opencv4`
+g++ -std=c++17 -O3 -march=native time_mirror.mm -o time_mirror `pkg-config --cflags --libs opencv4`
 
 # Run
 ./time_mirror
@@ -163,7 +163,7 @@ g++ -std=c++17 -O3 -march=native time_mirror.cpp -o time_mirror `pkg-config --cf
 **"opencv4.pc not found"**
 ```bash
 # Try opencv instead of opencv4
-g++ -std=c++17 -O3 -march=native time_mirror.cpp -o time_mirror `pkg-config --cflags --libs opencv`
+g++ -std=c++17 -O3 -march=native time_mirror.mm -o time_mirror `pkg-config --cflags --libs opencv`
 ```
 
 **Camera permission denied (macOS)**
@@ -176,7 +176,7 @@ g++ -std=c++17 -O3 -march=native time_mirror.cpp -o time_mirror `pkg-config --cf
 
 ## Configuration
 
-Edit these constants in `time_mirror.cpp`:
+Edit these constants in `time_mirror.mm`:
 
 ```cpp
 const int FRAME_WIDTH = 1920;   // Camera resolution width

@@ -120,10 +120,10 @@ Background = black
 - Uses the same `motionMap` as M/X modes
 - Up/Down adjusts `ghostSpacing`
 
-### G — Temporal Ghost *(requires seg server)*
+### G — Temporal Ghost
 ```
 7 echoes spaced tghostSpacing frames apart
-Each echo uses maskBuffer[fi[e]] (neural person mask) to isolate the subject
+Each echo uses maskBuffer[fi[e]] (Vision person mask) to isolate the subject
 Fade: oldest = 30% brightness, newest = 100%
 Background = black
 ```
@@ -132,7 +132,7 @@ Background = black
 - `maskBuffer` gaps propagated to avoid stale masks from previous buffer wrap
 - Up/Down adjusts `tghostSpacing` (range: 1 – `BUFFER_SIZE / TGHOST_ECHOES`)
 
-### K — Rainbow Ghost *(requires seg server)*
+### K — Rainbow Ghost
 ```
 7 echoes spaced tghostSpacing frames apart
 Each echo tinted a single hue spaced RAINBOW_HUE_STEP (45°) apart
@@ -146,15 +146,17 @@ Background = black
 
 ---
 
-## Segmentation subsystem (G, K, B modes)
+## Segmentation subsystem (G, K modes)
 
-`seg_server.py` runs as a subprocess communicating over stdin/stdout pipes:
-- **Input:** 256×256 RGB frame (raw bytes, `SEG_W * SEG_H * 3` bytes)
-- **Output:** 256×256 uint8 mask (raw bytes, `SEG_W * SEG_H` bytes)
-- **Model:** `selfie_segmenter_landscape.tflite` (~244 KB, MediaPipe)
-- **Mask convention:** 255 = person, 0 = background (inverted from MediaPipe's raw output)
+Person segmentation uses `VNGeneratePersonSegmentationRequest` from Apple's Vision framework (macOS 12+). No Python, MediaPipe, or external model files required.
 
-The mask is upscaled to full resolution with bilinear interpolation then Gaussian blurred (σ=12) for soft edges before storage in `maskBuffer`.
+**Pipeline (runs on dedicated background thread):**
+1. Wrap `frameBuffer[latest]` as a `CVPixelBuffer` (BGRA, zero-copy via `CVPixelBufferCreateWithBytes`)
+2. Feed to `VNImageRequestHandler` → `performRequests`
+3. Read back `VNPixelBufferObservation` mask (`OneComponent8`: 255 = person, 0 = background)
+4. Resize to full resolution (bilinear) and blur (σ=12) for soft edges
+5. Propagate mask to any buffer slots skipped since last segmentation
+6. Advance `segReady` (release) — render thread reads with `acquire`
 
 `segReady` is only advanced after the full mask write completes, so the render thread can safely read `maskBuffer[segReady]` without a lock.
 

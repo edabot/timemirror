@@ -2,6 +2,17 @@
 
 ---
 
+## 2026-04-25 — Replace Python/MediaPipe segmentation with Apple Vision framework
+
+### Changed
+- **G and K modes no longer require Python or MediaPipe** — person segmentation now uses `VNGeneratePersonSegmentationRequest` (built into macOS 12+). No installation needed on any target machine.
+- **Removed Python subprocess** — `launchSegServer()`, `seg_server.py`, and `.tflite` model file eliminated entirely. `segmentLoop()` now wraps each frame as a `CVPixelBuffer`, runs the Vision request synchronously on the background thread, and reads back the `OneComponent8` mask.
+- **Source file renamed** `time_mirror.cpp` → `time_mirror.mm` (Objective-C++ required for Vision API)
+- **Makefile** adds `-framework Vision -framework Foundation -framework CoreVideo`; removes `seg_server.py` and `.tflite` copy steps from `app` target
+- **Ambiguous `Size`/`Point` names** qualified as `cv::Size`/`cv::Point` to resolve conflict with MacTypes.h definitions pulled in by the ObjC headers
+
+---
+
 ## 2026-04-25 — Rainbow Ghost (K) tuning
 
 ### Changed
