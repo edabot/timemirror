@@ -32,11 +32,9 @@ Usage:
 #include <cmath>
 #include <thread>
 #include <atomic>
-#include <unistd.h>
-#include <signal.h>
-#include <sys/wait.h>
-#include <mach-o/dyld.h>
-#include <climits>
+#import <Vision/Vision.h>
+#import <Foundation/Foundation.h>
+#import <CoreVideo/CoreVideo.h>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -44,7 +42,6 @@ Usage:
 using namespace cv;
 using namespace std;
 using namespace chrono;
-
 // Configuration
 const int FRAME_WIDTH = 1920;
 const int FRAME_HEIGHT = 1080;
@@ -129,9 +126,9 @@ float turbShift = 20.0f;  // max pixel displacement at full turbulence (Up/Down 
 
 // Temporal Ghost mode (G) ─────────────────────────────────────────────────────
 // maskBuffer is a circular buffer of CV_8U masks parallel to frameBuffer.
-// A dedicated segment thread sends 256×256 frames to a Python subprocess
-// running MediaPipe selfie segmentation, receives uint8 masks, and upscales
-// them to full resolution before storing in maskBuffer.
+// segmentLoop() runs on a dedicated thread, feeding frames to the macOS
+// Vision framework (VNGeneratePersonSegmentationRequest) and storing the
+// resulting person masks in maskBuffer at full resolution.
 // segReady tracks the most recently completed mask slot.
 vector<Mat> maskBuffer;   // CV_8U, same slots as frameBuffer
 atomic<int> segReady{-1}; // index of last written mask; -1 = not started
@@ -140,9 +137,6 @@ const int TGHOST_ECHOES = 7;
 float rainbowHue = 0.0f;         // K mode: current base hue (0–360, cycles each frame)
 float rainbowSpeed = 30.0f;      // K mode: degrees per second the hue advances
 const int RAINBOW_HUE_STEP = 45; // degrees between consecutive echoes
-pid_t segServerPid = -1;         // Python subprocess PID
-int segWriteFd = -1;             // pipe: C++ writes frames → Python
-int segReadFd = -1;              // pipe: Python writes masks → C++
 
 // Main-thread-only state
 string currentMode = "s";
@@ -181,124 +175,100 @@ void captureLoop(VideoCapture &cap)
     }
 }
 
-// ── Segmentation subprocess ───────────────────────────────────────────────────
-// Spawns seg_server.py with two anonymous pipes for frame/mask I/O.
-// Returns true on success; sets segWriteFd, segReadFd, segServerPid.
-bool launchSegServer()
-{
-    int pipe_in[2], pipe_out[2];
-    if (pipe(pipe_in) || pipe(pipe_out))
-    {
-        cerr << "pipe() failed" << endl;
-        return false;
-    }
-
-    char exePath[PATH_MAX];
-    uint32_t exeSize = sizeof(exePath);
-    _NSGetExecutablePath(exePath, &exeSize);
-    string exeDir = string(exePath);
-    exeDir = exeDir.substr(0, exeDir.rfind('/'));
-    // When bundled: exe is in Contents/MacOS/, script is in Contents/Resources/
-    string script = exeDir + "/../Resources/seg_server.py";
-    if (access(script.c_str(), F_OK) != 0)
-        script = exeDir + "/seg_server.py"; // fallback for running outside bundle
-
-    pid_t pid = fork();
-    if (pid < 0)
-    {
-        cerr << "fork() failed" << endl;
-        return false;
-    }
-
-    if (pid == 0)
-    {
-        // Child: wire pipes to stdin/stdout, exec Python
-        dup2(pipe_in[0], STDIN_FILENO);
-        dup2(pipe_out[1], STDOUT_FILENO);
-        // Close unused ends
-        close(pipe_in[0]);
-        close(pipe_in[1]);
-        close(pipe_out[0]);
-        close(pipe_out[1]);
-        execl("/Library/Frameworks/Python.framework/Versions/3.13/bin/python3",
-              "python3", script.c_str(), nullptr);
-        _exit(1); // exec failed
-    }
-
-    // Parent: keep our ends, close child's ends
-    close(pipe_in[0]);
-    close(pipe_out[1]);
-    segWriteFd = pipe_in[1];
-    segReadFd = pipe_out[0];
-    segServerPid = pid;
-    signal(SIGPIPE, SIG_IGN); // avoid crash if subprocess dies
-    cout << "Seg server PID " << pid << " (script: " << script << ")" << endl;
-    return true;
-}
-
-// Reads the latest captured frame, sends 256×256 RGB to the Python subprocess,
-// receives the 256×256 uint8 mask, upscales and stores in maskBuffer.
-// Runs on a dedicated thread so the render loop is never blocked.
+// ── Segmentation thread (Vision framework) ────────────────────────────────────
+// Uses VNGeneratePersonSegmentationRequest (built into macOS 12+, no Python needed).
+// Feeds the latest captured frame as a CVPixelBuffer, reads back the person mask,
+// upscales to full resolution, and stores in maskBuffer.
+// segReady is only advanced after a complete write so the render thread reads safely.
 void segmentLoop(int actualWidth, int actualHeight)
 {
-    const int SEG_W = 256, SEG_H = 256;
-    const int FRAME_BYTES = SEG_W * SEG_H * 3;
-    const int MASK_BYTES = SEG_W * SEG_H;
+    @autoreleasepool {
+        VNGeneratePersonSegmentationRequest *request =
+            [[VNGeneratePersonSegmentationRequest alloc] init];
+        request.qualityLevel = VNGeneratePersonSegmentationRequestQualityLevelFast;
+        request.outputPixelFormat = kCVPixelFormatType_OneComponent8;
 
-    Mat small(SEG_H, SEG_W, CV_8UC3);
-    vector<uchar> maskBuf(MASK_BYTES);
-    int lastSeg = -1;
+        Mat bgraMat;
+        int lastSeg = -1;
 
-    while (running)
-    {
-        int latest = (writeIndex.load(memory_order_acquire) - 1 + BUFFER_SIZE) % BUFFER_SIZE;
-        if (latest == lastSeg)
+        while (running)
         {
-            this_thread::yield();
-            continue;
+            int latest = (writeIndex.load(memory_order_acquire) - 1 + BUFFER_SIZE) % BUFFER_SIZE;
+            if (latest == lastSeg)
+            {
+                this_thread::yield();
+                continue;
+            }
+
+            @autoreleasepool {
+                // Wrap the OpenCV frame in a CVPixelBuffer (no copy — zero overhead).
+                // bgraMat must stay alive until the handler finishes; it is declared
+                // outside the inner pool so its lifetime spans the performRequests call.
+                cv::cvtColor(frameBuffer[latest], bgraMat, COLOR_BGR2BGRA);
+
+                CVPixelBufferRef pixelBuffer = nullptr;
+                CVReturn status = CVPixelBufferCreateWithBytes(
+                    kCFAllocatorDefault,
+                    (size_t)bgraMat.cols, (size_t)bgraMat.rows,
+                    kCVPixelFormatType_32BGRA,
+                    bgraMat.data, (size_t)bgraMat.step[0],
+                    nullptr, nullptr, nullptr,
+                    &pixelBuffer);
+
+                if (status != kCVReturnSuccess || !pixelBuffer)
+                {
+                    lastSeg = latest;
+                    continue;
+                }
+
+                VNImageRequestHandler *handler = [[VNImageRequestHandler alloc]
+                    initWithCVPixelBuffer:pixelBuffer
+                    orientation:kCGImagePropertyOrientationUp
+                    options:@{}];
+                CVPixelBufferRelease(pixelBuffer);
+
+                NSError *err = nil;
+                [handler performRequests:@[request] error:&err];
+
+                if (!err && request.results.count > 0)
+                {
+                    VNPixelBufferObservation *obs =
+                        (VNPixelBufferObservation *)request.results[0];
+                    CVPixelBufferRef maskPB = obs.pixelBuffer;
+
+                    CVPixelBufferLockBaseAddress(maskPB, kCVPixelBufferLock_ReadOnly);
+                    int maskW = (int)CVPixelBufferGetWidth(maskPB);
+                    int maskH = (int)CVPixelBufferGetHeight(maskPB);
+                    void *base = CVPixelBufferGetBaseAddress(maskPB);
+                    size_t stride = CVPixelBufferGetBytesPerRow(maskPB);
+
+                    // Resize mask to full resolution and feather edges.
+                    // Vision returns 255=person, 0=background — matches maskBuffer convention.
+                    Mat maskSmall(maskH, maskW, CV_8U, base, stride);
+                    cv::resize(maskSmall, maskBuffer[latest],
+                               cv::Size(actualWidth, actualHeight), 0, 0, INTER_LINEAR);
+                    CVPixelBufferUnlockBaseAddress(maskPB, kCVPixelBufferLock_ReadOnly);
+
+                    cv::GaussianBlur(maskBuffer[latest], maskBuffer[latest], cv::Size(0, 0), 12.0);
+
+                    // Propagate mask to slots skipped since lastSeg so echo indices
+                    // never land on stale masks from a previous buffer wrap.
+                    if (lastSeg >= 0)
+                    {
+                        int span = (latest - lastSeg + BUFFER_SIZE) % BUFFER_SIZE;
+                        for (int i = 1; i < span; i++)
+                            maskBuffer[latest].copyTo(maskBuffer[(lastSeg + i) % BUFFER_SIZE]);
+                    }
+
+                    lastSeg = latest;
+                    segReady.store(latest, memory_order_release);
+                }
+                else
+                {
+                    lastSeg = latest;
+                }
+            }
         }
-
-        // Resize frame to 256×256, convert BGR→RGB
-        cv::resize(frameBuffer[latest], small, Size(SEG_W, SEG_H));
-        cv::cvtColor(small, small, COLOR_BGR2RGB);
-
-        // Send frame to Python subprocess
-        ssize_t written = 0;
-        while (written < FRAME_BYTES)
-        {
-            ssize_t n = write(segWriteFd, small.data + written, FRAME_BYTES - written);
-            if (n <= 0)
-                return;
-            written += n;
-        }
-
-        // Read mask back from Python subprocess
-        ssize_t got = 0;
-        while (got < MASK_BYTES)
-        {
-            ssize_t n = read(segReadFd, maskBuf.data() + got, MASK_BYTES - got);
-            if (n <= 0)
-                return;
-            got += n;
-        }
-
-        // Upscale 256×256 mask → full resolution with bilinear interpolation,
-        // then apply a modest Gaussian blur to feather the upscaled edges.
-        Mat m256(SEG_H, SEG_W, CV_8U, maskBuf.data());
-        cv::resize(m256, maskBuffer[latest], Size(actualWidth, actualHeight), 0, 0, INTER_LINEAR);
-        cv::GaussianBlur(maskBuffer[latest], maskBuffer[latest], Size(0, 0), 12.0);
-
-        // Propagate mask to any slots skipped since lastSeg so echo indices
-        // never land on stale masks from a previous buffer wrap.
-        if (lastSeg >= 0)
-        {
-            int span = (latest - lastSeg + BUFFER_SIZE) % BUFFER_SIZE;
-            for (int i = 1; i < span; i++)
-                maskBuffer[latest].copyTo(maskBuffer[(lastSeg + i) % BUFFER_SIZE]);
-        }
-
-        lastSeg = latest;
-        segReady.store(latest, memory_order_release);
     }
 }
 
@@ -868,10 +838,10 @@ void drawValueOverlay(Mat &output, const string &text, double timeSinceChange)
     double fontScale = 1.5;
     int thickness = 3;
     int baseline = 0;
-    Size textSize = getTextSize(speedText, fontFace, fontScale, thickness, &baseline);
+    cv::Size textSize = getTextSize(speedText, fontFace, fontScale, thickness, &baseline);
 
     int padding = 40;
-    Point textPos(output.cols - textSize.width - padding, output.rows - padding);
+    cv::Point textPos(output.cols - textSize.width - padding, output.rows - padding);
     putText(output, speedText, textPos, fontFace, fontScale, Scalar(255, 255, 255), thickness);
 }
 
@@ -979,9 +949,8 @@ int main()
     cout << "  Y            - Datamosh (motion trails via IIR diff accumulation)" << endl;
     cout << "  E            - Ghost Echo (7 motion-masked temporal echoes on black)" << endl;
     cout << "  B            - Background Removal (isolate moving foreground on black)" << endl;
-    cout << "  G            - Temporal Ghost (6 person silhouettes through time on black)" << endl;
+    cout << "  G            - Temporal Ghost (7 person silhouettes through time on black)" << endl;
     cout << "  K            - Rainbow Ghost (like G but echoes tinted with cycling hues)" << endl;
-    cout << "  T            - Turbulence (motion history → displacement + chroma + saturation)" << endl;
     cout << "  Up/Down      - Speed / Chroma / Flow sens / Spread / Echo / Band ht" << endl;
     cout << "  R            - Reset the above to defaults" << endl;
     cout << "  F            - Toggle fullscreen" << endl;
@@ -992,15 +961,9 @@ int main()
     // Start capture thread — decouples camera I/O from render loop
     thread captureThread(captureLoop, ref(cap));
 
-    // Launch segmentation subprocess and start segment thread.
-    // The subprocess runs seg_server.py (MediaPipe selfie segmentation).
-    // The segment thread sends 256×256 frames and receives uint8 masks at ~70fps.
-    bool segOk = launchSegServer();
-    thread segThread;
-    if (segOk)
-        segThread = thread(segmentLoop, actualWidth, actualHeight);
-    else
-        cout << "WARNING: seg server failed to start — G mode unavailable" << endl;
+    // Start segmentation thread — uses Vision framework (built into macOS 12+).
+    // No subprocess or external dependencies required.
+    thread segThread(segmentLoop, actualWidth, actualHeight);
 
     // Wait for first frame before rendering
     while (writeIndex.load(memory_order_acquire) == 0 && running)
@@ -1029,7 +992,7 @@ int main()
             cv::cvtColor(diffMat, grayDiff, COLOR_BGR2GRAY);
             // Blur at FLOW_SCALE resolution (~16× fewer pixels) then upsample
             cv::resize(grayDiff, motionSmall, motionSmall.size(), 0, 0, INTER_LINEAR);
-            cv::GaussianBlur(motionSmall, motionSmall, Size(MOTION_BLUR_SIZE, MOTION_BLUR_SIZE), 0);
+            cv::GaussianBlur(motionSmall, motionSmall, cv::Size(MOTION_BLUR_SIZE, MOTION_BLUR_SIZE), 0);
             cv::resize(motionSmall, grayDiff, grayDiff.size(), 0, 0, INTER_LINEAR);
             grayDiff.convertTo(motionMap, CV_32F, 1.0 / 255.0);
         }
@@ -1058,7 +1021,7 @@ int main()
             cv::absdiff(frameBuffer[recent], frameBuffer[older], diffMat);
             cv::cvtColor(diffMat, grayDiff, COLOR_BGR2GRAY);
             cv::resize(grayDiff, motionSmall, motionSmall.size(), 0, 0, INTER_LINEAR);
-            cv::GaussianBlur(motionSmall, motionSmall, Size(MOTION_BLUR_SIZE, MOTION_BLUR_SIZE), 0);
+            cv::GaussianBlur(motionSmall, motionSmall, cv::Size(MOTION_BLUR_SIZE, MOTION_BLUR_SIZE), 0);
             cv::resize(motionSmall, grayDiff, grayDiff.size(), 0, 0, INTER_LINEAR);
             cv::threshold(grayDiff, grayDiff, 20, 255, THRESH_TOZERO); // suppress camera noise
             grayDiff.convertTo(motionMap, CV_32F, 0.5 / 255.0);        // reuse motionMap as scratch
@@ -1284,23 +1247,13 @@ int main()
         }
         else if (key == 'g')
         {
-            if (segOk)
-            {
-                currentMode = "timeghost";
-                cout << "Mode: " << getModeName() << endl;
-            }
-            else
-                cout << "G mode unavailable: seg server did not start" << endl;
+            currentMode = "timeghost";
+            cout << "Mode: " << getModeName() << endl;
         }
         else if (key == 'k')
         {
-            if (segOk)
-            {
-                currentMode = "rainbowghost";
-                cout << "Mode: " << getModeName() << endl;
-            }
-            else
-                cout << "K mode unavailable: seg server did not start" << endl;
+            currentMode = "rainbowghost";
+            cout << "Mode: " << getModeName() << endl;
         }
         else if (key == 'f')
         {
@@ -1511,19 +1464,7 @@ int main()
 
     running = false;
     captureThread.join();
-
-    // Shut down segmentation subprocess and thread
-    if (segOk)
-    {
-        close(segWriteFd); // closing stdin signals Python to exit cleanly
-        close(segReadFd);
-        segThread.join();
-        if (segServerPid > 0)
-        {
-            kill(segServerPid, SIGTERM);
-            waitpid(segServerPid, nullptr, 0);
-        }
-    }
+    segThread.join();
 
     cap.release();
     destroyAllWindows();
