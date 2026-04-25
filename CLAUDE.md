@@ -101,7 +101,9 @@ This project captures live webcam footage and applies a time-displacement effect
 - **X** - Motion Chromatic (motion-driven per-pixel RGB temporal split; still=no color, moving=full chroma spread)
 - **P** - Prismatic Echo (6 spectral echoes spaced through the buffer; moving subjects leave rainbow trails)
 - **H** - Flow Direction Color (optical flow direction → hue, magnitude → saturation; directional color from motion)
-- **N** - Scan Glitch (bands of rows jump to random past frames with CRT horizontal shift; occasional full-frame flicker)
+- **N** - Turbulence (motion history accumulation drives pixel displacement + chroma split + saturation boost)
+- **G** - Temporal Ghost (7 neural-segmented person echoes through time on black; requires seg_server.py)
+- **K** - Rainbow Ghost (like G but each echo tinted a cycling hue; color flows newest→oldest; no temporal fade)
 
 ### Controls
 - **Arrow Up/Down** - Adjust speed (lines per frame)
@@ -352,7 +354,7 @@ These modes were implemented and tested but removed after evaluation.
 - [ ] **Echo Ghost** — overlay current frame with 3-5 semi-transparent older frames; sharp ghost images rather than blurred trails
 - [ ] **Directional Chroma** — like X (Motion Chromatic) but channel split direction follows motion direction (horizontal motion → horizontal split, vertical → vertical)
 - [ ] **Angle Clock** — divide frame into radial sectors; each sector sweeps through time like a clock hand, sectors at different angles show different moments
-- ~~**Scan Glitch**~~ ✓ Done (key N — see Special Effect Modes above)
+- ~~**Scan Glitch**~~ Removed — replaced by Turbulence (N)
 
 ### Performance Ideas
 - Shader-based implementation (OpenGL/Metal)

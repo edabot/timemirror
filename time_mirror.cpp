@@ -32,6 +32,11 @@ Usage:
 #include <cmath>
 #include <thread>
 #include <atomic>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <mach-o/dyld.h>
+#include <climits>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -57,6 +62,14 @@ int motionMaxOffset = 40; // Max frames back at full motion (higher = more dream
 
 // Motion-chromatic mode settings (runtime-adjustable with Up/Down in mchroma mode)
 int chromaSpread = 40; // Max frames between channels at full motion (0-motion = no split)
+
+// Ghost Echo mode (E) — motion-masked stack of 7 temporal echoes.
+// Still areas → black. Moving subjects → layered ghost images from past frames.
+int ghostSpacing = 8; // Frames between each of 7 echoes (Up/Down adjustable)
+
+// Background Removal mode (B) — MOG2 Gaussian mixture background subtractor.
+// Learns background automatically; only updates background model for background pixels,
+// so a stationary subject does not bleed into the background estimate over time.
 
 // Shared between capture thread and main thread.
 // writeIndex uses release/acquire semantics so the main thread always
@@ -114,6 +127,23 @@ int turbFrame = 0;
 float turbDecay = 0.992f; // IIR decay (~2s half-life at 60fps)
 float turbShift = 20.0f;  // max pixel displacement at full turbulence (Up/Down adjustable)
 
+// Temporal Ghost mode (G) ─────────────────────────────────────────────────────
+// maskBuffer is a circular buffer of CV_8U masks parallel to frameBuffer.
+// A dedicated segment thread sends 256×256 frames to a Python subprocess
+// running MediaPipe selfie segmentation, receives uint8 masks, and upscales
+// them to full resolution before storing in maskBuffer.
+// segReady tracks the most recently completed mask slot.
+vector<Mat> maskBuffer;   // CV_8U, same slots as frameBuffer
+atomic<int> segReady{-1}; // index of last written mask; -1 = not started
+int tghostSpacing = 20;   // frames between each of TGHOST_ECHOES echoes
+const int TGHOST_ECHOES = 7;
+float rainbowHue = 0.0f;         // K mode: current base hue (0–360, cycles each frame)
+float rainbowSpeed = 30.0f;      // K mode: degrees per second the hue advances
+const int RAINBOW_HUE_STEP = 45; // degrees between consecutive echoes
+pid_t segServerPid = -1;         // Python subprocess PID
+int segWriteFd = -1;             // pipe: C++ writes frames → Python
+int segReadFd = -1;              // pipe: Python writes masks → C++
+
 // Main-thread-only state
 string currentMode = "s";
 map<char, steady_clock::time_point> lastKeyTime;
@@ -148,6 +178,127 @@ void captureLoop(VideoCapture &cap)
             frameBuffer[prev].copyTo(frameBuffer[idx]);
             writeIndex.store((idx + 1) % BUFFER_SIZE, memory_order_release);
         }
+    }
+}
+
+// ── Segmentation subprocess ───────────────────────────────────────────────────
+// Spawns seg_server.py with two anonymous pipes for frame/mask I/O.
+// Returns true on success; sets segWriteFd, segReadFd, segServerPid.
+bool launchSegServer()
+{
+    int pipe_in[2], pipe_out[2];
+    if (pipe(pipe_in) || pipe(pipe_out))
+    {
+        cerr << "pipe() failed" << endl;
+        return false;
+    }
+
+    char exePath[PATH_MAX];
+    uint32_t exeSize = sizeof(exePath);
+    _NSGetExecutablePath(exePath, &exeSize);
+    string exeDir = string(exePath);
+    exeDir = exeDir.substr(0, exeDir.rfind('/'));
+    // When bundled: exe is in Contents/MacOS/, script is in Contents/Resources/
+    string script = exeDir + "/../Resources/seg_server.py";
+    if (access(script.c_str(), F_OK) != 0)
+        script = exeDir + "/seg_server.py"; // fallback for running outside bundle
+
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        cerr << "fork() failed" << endl;
+        return false;
+    }
+
+    if (pid == 0)
+    {
+        // Child: wire pipes to stdin/stdout, exec Python
+        dup2(pipe_in[0], STDIN_FILENO);
+        dup2(pipe_out[1], STDOUT_FILENO);
+        // Close unused ends
+        close(pipe_in[0]);
+        close(pipe_in[1]);
+        close(pipe_out[0]);
+        close(pipe_out[1]);
+        execl("/Library/Frameworks/Python.framework/Versions/3.13/bin/python3",
+              "python3", script.c_str(), nullptr);
+        _exit(1); // exec failed
+    }
+
+    // Parent: keep our ends, close child's ends
+    close(pipe_in[0]);
+    close(pipe_out[1]);
+    segWriteFd = pipe_in[1];
+    segReadFd = pipe_out[0];
+    segServerPid = pid;
+    signal(SIGPIPE, SIG_IGN); // avoid crash if subprocess dies
+    cout << "Seg server PID " << pid << " (script: " << script << ")" << endl;
+    return true;
+}
+
+// Reads the latest captured frame, sends 256×256 RGB to the Python subprocess,
+// receives the 256×256 uint8 mask, upscales and stores in maskBuffer.
+// Runs on a dedicated thread so the render loop is never blocked.
+void segmentLoop(int actualWidth, int actualHeight)
+{
+    const int SEG_W = 256, SEG_H = 256;
+    const int FRAME_BYTES = SEG_W * SEG_H * 3;
+    const int MASK_BYTES = SEG_W * SEG_H;
+
+    Mat small(SEG_H, SEG_W, CV_8UC3);
+    vector<uchar> maskBuf(MASK_BYTES);
+    int lastSeg = -1;
+
+    while (running)
+    {
+        int latest = (writeIndex.load(memory_order_acquire) - 1 + BUFFER_SIZE) % BUFFER_SIZE;
+        if (latest == lastSeg)
+        {
+            this_thread::yield();
+            continue;
+        }
+
+        // Resize frame to 256×256, convert BGR→RGB
+        cv::resize(frameBuffer[latest], small, Size(SEG_W, SEG_H));
+        cv::cvtColor(small, small, COLOR_BGR2RGB);
+
+        // Send frame to Python subprocess
+        ssize_t written = 0;
+        while (written < FRAME_BYTES)
+        {
+            ssize_t n = write(segWriteFd, small.data + written, FRAME_BYTES - written);
+            if (n <= 0)
+                return;
+            written += n;
+        }
+
+        // Read mask back from Python subprocess
+        ssize_t got = 0;
+        while (got < MASK_BYTES)
+        {
+            ssize_t n = read(segReadFd, maskBuf.data() + got, MASK_BYTES - got);
+            if (n <= 0)
+                return;
+            got += n;
+        }
+
+        // Upscale 256×256 mask → full resolution with bilinear interpolation,
+        // then apply a modest Gaussian blur to feather the upscaled edges.
+        Mat m256(SEG_H, SEG_W, CV_8U, maskBuf.data());
+        cv::resize(m256, maskBuffer[latest], Size(actualWidth, actualHeight), 0, 0, INTER_LINEAR);
+        cv::GaussianBlur(maskBuffer[latest], maskBuffer[latest], Size(0, 0), 12.0);
+
+        // Propagate mask to any slots skipped since lastSeg so echo indices
+        // never land on stale masks from a previous buffer wrap.
+        if (lastSeg >= 0)
+        {
+            int span = (latest - lastSeg + BUFFER_SIZE) % BUFFER_SIZE;
+            for (int i = 1; i < span; i++)
+                maskBuffer[latest].copyTo(maskBuffer[(lastSeg + i) % BUFFER_SIZE]);
+        }
+
+        lastSeg = latest;
+        segReady.store(latest, memory_order_release);
     }
 }
 
@@ -364,6 +515,172 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
         // Still areas: accum → 0 → black.  Moving areas: bright colour that decays over time.
         datamoshAccum.convertTo(output, CV_8UC3);
     }
+    else if (currentMode == "ghostecho")
+    {
+        // 7 temporal echoes stacked with triangular weights (newest = brightest).
+        // motionMap masks the output: still areas → black, moving areas → ghost stack.
+        // Frame indices are hoisted out of the parallel loop — one per echo.
+        int fi[7];
+        for (int e = 0; e < 7; e++)
+            fi[e] = (bufIdx - 1 - e * ghostSpacing + BUFFER_SIZE * 10) % BUFFER_SIZE;
+        // Triangular weights: e=0 → 7/28, e=1 → 6/28 … e=6 → 1/28
+        static const float w[7] = {7 / 28.f, 6 / 28.f, 5 / 28.f, 4 / 28.f, 3 / 28.f, 2 / 28.f, 1 / 28.f};
+#pragma omp parallel for schedule(static)
+        for (int y = 0; y < height; y++)
+        {
+            const float *motRow = motionMap.ptr<float>(y);
+            Vec3b *outRow = output.ptr<Vec3b>(y);
+            for (int x = 0; x < width; x++)
+            {
+                float m = motRow[x];
+                if (m < 0.05f)
+                {
+                    outRow[x] = Vec3b(0, 0, 0);
+                    continue;
+                }
+                float B = 0, G = 0, R = 0;
+                for (int e = 0; e < 7; e++)
+                {
+                    const Vec3b &p = frameBuffer[fi[e]].ptr<Vec3b>(y)[x];
+                    B += p[0] * w[e];
+                    G += p[1] * w[e];
+                    R += p[2] * w[e];
+                }
+                // Ramp up to full brightness as motion increases
+                float boost = min(m * 3.0f, 1.0f);
+                outRow[x][0] = (uchar)min(255.f, B * boost * 2.0f);
+                outRow[x][1] = (uchar)min(255.f, G * boost * 2.0f);
+                outRow[x][2] = (uchar)min(255.f, R * boost * 2.0f);
+            }
+        }
+    }
+    else if (currentMode == "timeghost")
+    {
+        // Composite TGHOST_ECHOES silhouettes of the person from different moments in time.
+        // maskBuffer provides per-pixel person masks (255=person, 0=background).
+        // Echoes are painted oldest→newest; newest always wins at overlapping pixels.
+        // Fade: oldest echo = 30% brightness, newest = 100%.
+        // Use segReady as the base — it is only advanced AFTER a full mask write
+        // completes, so maskBuffer[base] is always fully written and safe to read.
+        // Using bufIdx-1 instead would race with the segment thread writing to that
+        // same slot, producing horizontal banding artifacts.
+        int base = segReady.load(memory_order_acquire);
+        if (base < 0)
+        {
+            output.setTo(Scalar(0, 0, 0));
+            return;
+        }
+        int fi[TGHOST_ECHOES];
+        for (int e = 0; e < TGHOST_ECHOES; e++)
+            fi[e] = (base - e * tghostSpacing + BUFFER_SIZE * 10) % BUFFER_SIZE;
+
+#pragma omp parallel for schedule(static)
+        for (int y = 0; y < height; y++)
+        {
+            Vec3b *outRow = output.ptr<Vec3b>(y);
+            for (int x = 0; x < width; x++)
+            {
+                outRow[x] = Vec3b(0, 0, 0);
+                // Paint oldest to newest so newest overwrites at current position.
+                // Soft mask alpha feathers edges; temporal fade dims older echoes.
+                for (int e = TGHOST_ECHOES - 1; e >= 0; e--)
+                {
+                    float maskAlpha = maskBuffer[fi[e]].ptr<uchar>(y)[x] / 255.0f;
+                    if (maskAlpha < 0.05f)
+                        continue;
+                    float fade = 0.30f + 0.70f * (1.0f - (float)e / (TGHOST_ECHOES - 1));
+                    float total = maskAlpha * fade;
+                    const Vec3b &p = frameBuffer[fi[e]].ptr<Vec3b>(y)[x];
+                    outRow[x][0] = (uchar)(p[0] * total);
+                    outRow[x][1] = (uchar)(p[1] * total);
+                    outRow[x][2] = (uchar)(p[2] * total);
+                }
+            }
+        }
+    }
+    else if (currentMode == "rainbowghost")
+    {
+        // Like Temporal Ghost but each echo is tinted a single hue instead of using
+        // natural colour. Hues are spaced RAINBOW_HUE_STEP degrees apart and the base
+        // hue advances each frame so colours appear to travel down through the echoes.
+        // Per-echo BGR precomputed outside the pixel loop (6 values, not per-pixel).
+        int base = segReady.load(memory_order_acquire);
+        if (base < 0)
+        {
+            output.setTo(Scalar(0, 0, 0));
+            return;
+        }
+
+        int fi[TGHOST_ECHOES];
+        for (int e = 0; e < TGHOST_ECHOES; e++)
+            fi[e] = (base - e * tghostSpacing + BUFFER_SIZE * 10) % BUFFER_SIZE;
+
+        // Precompute hue→BGR for each echo (no fade — all echoes at full brightness)
+        float eB[TGHOST_ECHOES], eG[TGHOST_ECHOES], eR[TGHOST_ECHOES];
+        for (int e = 0; e < TGHOST_ECHOES; e++)
+        {
+            float hue = fmod(rainbowHue - e * RAINBOW_HUE_STEP + 360.0f * TGHOST_ECHOES, 360.0f);
+            float h6 = hue / 60.0f;
+            int hi = (int)h6 % 6;
+            float f = h6 - (int)h6;
+            float q = 1.0f - f;
+            switch (hi)
+            {
+            case 0:
+                eR[e] = 1;
+                eG[e] = f;
+                eB[e] = 0;
+                break;
+            case 1:
+                eR[e] = q;
+                eG[e] = 1;
+                eB[e] = 0;
+                break;
+            case 2:
+                eR[e] = 0;
+                eG[e] = 1;
+                eB[e] = f;
+                break;
+            case 3:
+                eR[e] = 0;
+                eG[e] = q;
+                eB[e] = 1;
+                break;
+            case 4:
+                eR[e] = f;
+                eG[e] = 0;
+                eB[e] = 1;
+                break;
+            default:
+                eR[e] = 1;
+                eG[e] = 0;
+                eB[e] = q;
+                break;
+            }
+        }
+
+#pragma omp parallel for schedule(static)
+        for (int y = 0; y < height; y++)
+        {
+            Vec3b *outRow = output.ptr<Vec3b>(y);
+            for (int x = 0; x < width; x++)
+            {
+                outRow[x] = Vec3b(0, 0, 0);
+                for (int e = TGHOST_ECHOES - 1; e >= 0; e--)
+                {
+                    float maskAlpha = maskBuffer[fi[e]].ptr<uchar>(y)[x] / 255.0f;
+                    if (maskAlpha < 0.05f)
+                        continue;
+                    const Vec3b &p = frameBuffer[fi[e]].ptr<Vec3b>(y)[x];
+                    float lum = (0.114f * p[0] + 0.587f * p[1] + 0.299f * p[2]) / 255.0f;
+                    float brightness = lum * maskAlpha * 255.0f;
+                    outRow[x][0] = (uchar)min(255.0f, eB[e] * brightness);
+                    outRow[x][1] = (uchar)min(255.0f, eG[e] * brightness);
+                    outRow[x][2] = (uchar)min(255.0f, eR[e] * brightness);
+                }
+            }
+        }
+    }
     else if (currentMode == "flowripple")
     {
         // rippleBuffer is maintained by the preprocessing block (advect + decay + inject).
@@ -528,6 +845,12 @@ string getModeName()
         return "J: Flow Color Ripple";
     if (currentMode == "datamosh")
         return "Y: Datamosh";
+    if (currentMode == "ghostecho")
+        return "E: Ghost Echo";
+    if (currentMode == "timeghost")
+        return "G: Temporal Ghost";
+    if (currentMode == "rainbowghost")
+        return "K: Rainbow Ghost";
     if (currentMode == "turbulence")
         return "N: Turbulence";
     return "Unknown";
@@ -565,7 +888,14 @@ int main()
 #endif
     cout << "========================================" << endl;
 
-    VideoCapture cap(0);
+    VideoCapture cap;
+    for (int attempt = 0; attempt < 20; ++attempt)
+    {
+        cap.open(0);
+        if (cap.isOpened())
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
     if (!cap.isOpened())
     {
         cerr << "ERROR: Cannot open camera" << endl;
@@ -626,6 +956,13 @@ int main()
     turbNoiseX.assign(actualWidth, 0.0f);
     turbNoiseY.assign(actualWidth, 0.0f);
 
+    // Pre-allocate background removal mask; MOG2 subtractor created on mode entry
+
+    // Pre-allocate temporal ghost mask buffer — one CV_8U mask per frame slot
+    maskBuffer.resize(BUFFER_SIZE);
+    for (int i = 0; i < BUFFER_SIZE; i++)
+        maskBuffer[i] = Mat::zeros(actualHeight, actualWidth, CV_8U);
+
     namedWindow("Time Mirror Effect", WINDOW_NORMAL);
     resizeWindow("Time Mirror Effect", 1280, 720);
 
@@ -640,6 +977,10 @@ int main()
     cout << "  J            - Flow color ripple (directional color that lingers and drifts)" << endl;
     cout << "  N            - Turbulence (motion history → displacement + chroma + saturation)" << endl;
     cout << "  Y            - Datamosh (motion trails via IIR diff accumulation)" << endl;
+    cout << "  E            - Ghost Echo (7 motion-masked temporal echoes on black)" << endl;
+    cout << "  B            - Background Removal (isolate moving foreground on black)" << endl;
+    cout << "  G            - Temporal Ghost (6 person silhouettes through time on black)" << endl;
+    cout << "  K            - Rainbow Ghost (like G but echoes tinted with cycling hues)" << endl;
     cout << "  T            - Turbulence (motion history → displacement + chroma + saturation)" << endl;
     cout << "  Up/Down      - Speed / Chroma / Flow sens / Spread / Echo / Band ht" << endl;
     cout << "  R            - Reset the above to defaults" << endl;
@@ -650,6 +991,16 @@ int main()
 
     // Start capture thread — decouples camera I/O from render loop
     thread captureThread(captureLoop, ref(cap));
+
+    // Launch segmentation subprocess and start segment thread.
+    // The subprocess runs seg_server.py (MediaPipe selfie segmentation).
+    // The segment thread sends 256×256 frames and receives uint8 masks at ~70fps.
+    bool segOk = launchSegServer();
+    thread segThread;
+    if (segOk)
+        segThread = thread(segmentLoop, actualWidth, actualHeight);
+    else
+        cout << "WARNING: seg server failed to start — G mode unavailable" << endl;
 
     // Wait for first frame before rendering
     while (writeIndex.load(memory_order_acquire) == 0 && running)
@@ -670,7 +1021,7 @@ int main()
         int bufIdx = writeIndex.load(memory_order_acquire);
 
         // Build motion map — used by motion and mchroma modes
-        if (currentMode == "motion" || currentMode == "mchroma")
+        if (currentMode == "motion" || currentMode == "mchroma" || currentMode == "ghostecho")
         {
             int recent = (bufIdx - 1 + BUFFER_SIZE * 2) % BUFFER_SIZE;
             int older = (bufIdx - 1 - MOTION_LOOKBACK + BUFFER_SIZE * 2) % BUFFER_SIZE;
@@ -716,6 +1067,10 @@ int main()
             cv::min(turbulenceMap, 1.0f, turbulenceMap);
             turbFrame++;
         }
+
+        // Advance rainbow hue — used by rainbowghost mode.
+        if (currentMode == "rainbowghost")
+            rainbowHue = fmod(rainbowHue + rainbowSpeed / 60.0f, 360.0f);
 
         // Compute optical flow — used by flowhue and flowripple modes.
         // Farneback runs at FLOW_SCALE resolution then is resized up for speed.
@@ -922,6 +1277,31 @@ int main()
             datamoshAccum.setTo(0); // fresh slate each entry
             cout << "Mode: " << getModeName() << endl;
         }
+        else if (key == 'e')
+        {
+            currentMode = "ghostecho";
+            cout << "Mode: " << getModeName() << endl;
+        }
+        else if (key == 'g')
+        {
+            if (segOk)
+            {
+                currentMode = "timeghost";
+                cout << "Mode: " << getModeName() << endl;
+            }
+            else
+                cout << "G mode unavailable: seg server did not start" << endl;
+        }
+        else if (key == 'k')
+        {
+            if (segOk)
+            {
+                currentMode = "rainbowghost";
+                cout << "Mode: " << getModeName() << endl;
+            }
+            else
+                cout << "K mode unavailable: seg server did not start" << endl;
+        }
         else if (key == 'f')
         {
             isFullscreen = !isFullscreen;
@@ -970,6 +1350,21 @@ int main()
             {
                 turbShift = 20.0f;
                 overlayText = "Shift: " + to_string((int)turbShift);
+            }
+            else if (currentMode == "ghostecho")
+            {
+                ghostSpacing = 8;
+                overlayText = "Spacing: " + to_string(ghostSpacing);
+            }
+            else if (currentMode == "timeghost")
+            {
+                tghostSpacing = 20;
+                overlayText = "Spacing: " + to_string(tghostSpacing);
+            }
+            else if (currentMode == "rainbowghost")
+            {
+                tghostSpacing = 20;
+                overlayText = "Spacing: " + to_string(tghostSpacing);
             }
             else
             {
@@ -1022,6 +1417,21 @@ int main()
                 turbShift = min(60.0f, turbShift + 2.0f);
                 overlayText = "Shift: " + to_string((int)turbShift);
             }
+            else if (currentMode == "ghostecho")
+            {
+                ghostSpacing = min(BUFFER_SIZE / 7, ghostSpacing + 1);
+                overlayText = "Spacing: " + to_string(ghostSpacing);
+            }
+            else if (currentMode == "timeghost")
+            {
+                tghostSpacing = min(BUFFER_SIZE / TGHOST_ECHOES, tghostSpacing + 1);
+                overlayText = "Spacing: " + to_string(tghostSpacing);
+            }
+            else if (currentMode == "rainbowghost")
+            {
+                tghostSpacing = min(BUFFER_SIZE / TGHOST_ECHOES, tghostSpacing + 1);
+                overlayText = "Spacing: " + to_string(tghostSpacing);
+            }
             else
             {
                 updateSpeed.store(min(BUFFER_SIZE, updateSpeed.load() + 1));
@@ -1073,6 +1483,21 @@ int main()
                 turbShift = max(2.0f, turbShift - 2.0f);
                 overlayText = "Shift: " + to_string((int)turbShift);
             }
+            else if (currentMode == "ghostecho")
+            {
+                ghostSpacing = max(1, ghostSpacing - 1);
+                overlayText = "Spacing: " + to_string(ghostSpacing);
+            }
+            else if (currentMode == "timeghost")
+            {
+                tghostSpacing = max(1, tghostSpacing - 1);
+                overlayText = "Spacing: " + to_string(tghostSpacing);
+            }
+            else if (currentMode == "rainbowghost")
+            {
+                tghostSpacing = max(1, tghostSpacing - 1);
+                overlayText = "Spacing: " + to_string(tghostSpacing);
+            }
             else
             {
                 updateSpeed.store(max(1, updateSpeed.load() - 1));
@@ -1086,6 +1511,20 @@ int main()
 
     running = false;
     captureThread.join();
+
+    // Shut down segmentation subprocess and thread
+    if (segOk)
+    {
+        close(segWriteFd); // closing stdin signals Python to exit cleanly
+        close(segReadFd);
+        segThread.join();
+        if (segServerPid > 0)
+        {
+            kill(segServerPid, SIGTERM);
+            waitpid(segServerPid, nullptr, 0);
+        }
+    }
+
     cap.release();
     destroyAllWindows();
     cout << "\nProgram ended" << endl;
