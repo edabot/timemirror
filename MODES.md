@@ -151,8 +151,8 @@ Background = black
 Person segmentation uses `VNGeneratePersonSegmentationRequest` from Apple's Vision framework (macOS 12+). No Python, MediaPipe, or external model files required.
 
 **Pipeline (runs on dedicated background thread):**
-1. Wrap `frameBuffer[latest]` as a `CVPixelBuffer` (BGRA, zero-copy via `CVPixelBufferCreateWithBytes`)
-2. Feed to `VNImageRequestHandler` → `performRequests`
+1. Convert `frameBuffer[latest]` BGR→BGRA; copy into a Vision-owned `CVPixelBuffer` (`CVPixelBufferCreate` + `memcpy` — Vision may hold GPU refs past `performRequests` return, so zero-copy is unsafe)
+2. Feed to `VNSequenceRequestHandler` → `performRequests:onCVPixelBuffer:` (reused across frames; correct API for video, avoids per-frame GPU resource churn)
 3. Read back `VNPixelBufferObservation` mask (`OneComponent8`: 255 = person, 0 = background)
 4. Resize to full resolution (bilinear) and blur (σ=12) for soft edges
 5. Propagate mask to any buffer slots skipped since last segmentation

@@ -188,6 +188,11 @@ void segmentLoop(int actualWidth, int actualHeight)
         request.qualityLevel = VNGeneratePersonSegmentationRequestQualityLevelFast;
         request.outputPixelFormat = kCVPixelFormatType_OneComponent8;
 
+        // VNSequenceRequestHandler is designed for video: reused across frames,
+        // maintains temporal state, and avoids per-frame GPU resource churn that
+        // causes VNImageRequestHandler to stall after extended use.
+        VNSequenceRequestHandler *seqHandler = [[VNSequenceRequestHandler alloc] init];
+
         Mat bgraMat;
         int lastSeg = -1;
 
@@ -201,19 +206,18 @@ void segmentLoop(int actualWidth, int actualHeight)
             }
 
             @autoreleasepool {
-                // Wrap the OpenCV frame in a CVPixelBuffer (no copy — zero overhead).
-                // bgraMat must stay alive until the handler finishes; it is declared
-                // outside the inner pool so its lifetime spans the performRequests call.
                 cv::cvtColor(frameBuffer[latest], bgraMat, COLOR_BGR2BGRA);
 
+                // Allocate a Vision-owned pixel buffer and copy the frame into it.
+                // CVPixelBufferCreateWithBytes (zero-copy) is unsafe here because
+                // Vision may retain GPU references to the buffer asynchronously
+                // past performRequests return, corrupting bgraMat on the next frame.
                 CVPixelBufferRef pixelBuffer = nullptr;
-                CVReturn status = CVPixelBufferCreateWithBytes(
+                CVReturn status = CVPixelBufferCreate(
                     kCFAllocatorDefault,
                     (size_t)bgraMat.cols, (size_t)bgraMat.rows,
                     kCVPixelFormatType_32BGRA,
-                    bgraMat.data, (size_t)bgraMat.step[0],
-                    nullptr, nullptr, nullptr,
-                    &pixelBuffer);
+                    nullptr, &pixelBuffer);
 
                 if (status != kCVReturnSuccess || !pixelBuffer)
                 {
@@ -221,14 +225,18 @@ void segmentLoop(int actualWidth, int actualHeight)
                     continue;
                 }
 
-                VNImageRequestHandler *handler = [[VNImageRequestHandler alloc]
-                    initWithCVPixelBuffer:pixelBuffer
-                    orientation:kCGImagePropertyOrientationUp
-                    options:@{}];
-                CVPixelBufferRelease(pixelBuffer);
+                CVPixelBufferLockBaseAddress(pixelBuffer, 0);
+                uint8_t *dst = (uint8_t *)CVPixelBufferGetBaseAddress(pixelBuffer);
+                size_t dstStride = CVPixelBufferGetBytesPerRow(pixelBuffer);
+                for (int row = 0; row < bgraMat.rows; row++)
+                    memcpy(dst + row * dstStride, bgraMat.ptr(row), (size_t)bgraMat.cols * 4);
+                CVPixelBufferUnlockBaseAddress(pixelBuffer, 0);
 
                 NSError *err = nil;
-                [handler performRequests:@[request] error:&err];
+                [seqHandler performRequests:@[request]
+                            onCVPixelBuffer:pixelBuffer
+                                      error:&err];
+                CVPixelBufferRelease(pixelBuffer);
 
                 if (!err && request.results.count > 0)
                 {

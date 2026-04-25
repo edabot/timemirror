@@ -2,6 +2,15 @@
 
 ---
 
+## 2026-04-25 — Fix segmentation thread stall at high echo spacing
+
+### Fixed
+- **G/K image freezes after a few minutes at high `tghostSpacing`** — two root causes:
+  1. `CVPixelBufferCreateWithBytes` gave Vision a pointer into `bgraMat.data` with no release callback. Vision can hold GPU references to the buffer past `performRequests` return; the next frame then overwrites that memory, corrupting Vision's state over time. Fix: `CVPixelBufferCreate` (Vision-owned allocation) + `memcpy`.
+  2. Creating a new `VNImageRequestHandler` every frame accumulates GPU/Metal resources and eventually stalls. Fix: `VNSequenceRequestHandler` reused across all frames — the correct API for video, avoids per-frame resource churn.
+
+---
+
 ## 2026-04-25 — Replace Python/MediaPipe segmentation with Apple Vision framework
 
 ### Changed
