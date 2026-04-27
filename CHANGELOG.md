@@ -2,6 +2,14 @@
 
 ---
 
+## 2026-04-27 — Fix Datamosh (Y) black screen on entry
+
+### Fixed
+- **Datamosh shows black screen or occasional flashes on switch** — diff was computed between adjacent buffer slots (`bufIdx-1` vs `bufIdx-2`). At 60fps objects barely move between consecutive frames, so diffs are near-zero and the IIR accumulator decays to black faster than it builds. With `updateSpeed > 1`, adjacent slots are duplicate camera frames (diff = 0 identically). Fix: compare `MOTION_LOOKBACK` (10) frames apart, matching the other motion modes.
+- **`DATAMOSH_BOOST` reduced 5.0 → 1.5** — with the larger 10-frame diff, the old boost caused immediate saturation to white; 1.5 gives trails that build naturally and remain tuneable with Up/Down.
+
+---
+
 ## 2026-04-27 — Fix segmentation thread freeze after ~8 minutes
 
 ### Fixed

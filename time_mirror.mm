@@ -102,7 +102,7 @@ float flowSensitivity = 10.0f;  // flow px/frame (small-scale) that maps to full
 Mat datamoshAccum;                 // CV_32FC3, signed accumulator
 Mat datamoshDiffF;                 // CV_32FC3 scratch for the per-frame diff
 float datamoshDecay = 0.92f;       // IIR decay per frame (higher = longer trails)
-const float DATAMOSH_BOOST = 5.0f; // diff amplification before accumulation
+const float DATAMOSH_BOOST = 1.5f; // diff amplification before accumulation
 
 // Flow Ripple mode (J) — directional color that advects with optical flow and decays over ~1 second.
 // rippleBuffer holds accumulated per-pixel BGR color as float [0–255].
@@ -1011,13 +1011,14 @@ int main()
         }
 
         // Update datamosh accumulator — used by datamosh mode.
-        // absdiff(current, previous) gives per-pixel color change; accumulated with
-        // IIR decay so motion leaves bright trails that fade over time.
+        // Diffs MOTION_LOOKBACK frames apart (not adjacent) so pixel displacement
+        // is large enough to be visible at 60fps. Adjacent frames produce near-zero
+        // diffs that collapse the accumulator to black before trails can build up.
         // Reuses diffMat (CV_8UC3) scratch buffer already declared for motion mode.
         if (currentMode == "datamosh")
         {
             int curr = (bufIdx - 1 + BUFFER_SIZE * 2) % BUFFER_SIZE;
-            int prev = (bufIdx - 2 + BUFFER_SIZE * 2) % BUFFER_SIZE;
+            int prev = (bufIdx - 1 - MOTION_LOOKBACK + BUFFER_SIZE * 2) % BUFFER_SIZE;
             cv::absdiff(frameBuffer[curr], frameBuffer[prev], diffMat);
             diffMat.convertTo(datamoshDiffF, CV_32FC3);
             cv::addWeighted(datamoshAccum, datamoshDecay,
