@@ -2,6 +2,14 @@
 
 ---
 
+## 2026-04-27 — Harden segmentation thread against crash on empty frame or unexpected Vision result
+
+### Fixed
+- **Empty frame guard** — if `cvtColor` produces an empty or zero-size `bgraMat` (e.g., during startup before the camera has delivered the first frame), `CVPixelBufferCreate` would be called with width=0/height=0. Guard added: skip the frame if `bgraMat.empty()` or either dimension is zero.
+- **Vision result type validation** — `request.results[0]` was cast directly to `VNPixelBufferObservation *` with no type check. If Vision ever returns a result of a different class, dereferencing `obs.pixelBuffer` would be an unrecognised-selector crash. Added `isKindOfClass:[VNPixelBufferObservation class]` check before the cast, plus a nil guard on `obs` and `obs.pixelBuffer`.
+
+---
+
 ## 2026-04-27 — Fix Flow Direction Color (H) grayscale and Flow Ripple (J) no-color
 
 ### Fixed

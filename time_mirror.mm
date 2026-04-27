@@ -212,6 +212,11 @@ void segmentLoop(int actualWidth, int actualHeight)
                 if (++segFrameCount % SEG_RESET_INTERVAL == 0)
                     seqHandler = [[VNSequenceRequestHandler alloc] init];
                 cv::cvtColor(frameBuffer[latest], bgraMat, COLOR_BGR2BGRA);
+                if (bgraMat.empty() || bgraMat.cols == 0 || bgraMat.rows == 0)
+                {
+                    lastSeg = latest;
+                    continue;
+                }
 
                 // Allocate a Vision-owned pixel buffer and copy the frame into it.
                 // CVPixelBufferCreateWithBytes (zero-copy) is unsafe here because
@@ -243,10 +248,12 @@ void segmentLoop(int actualWidth, int actualHeight)
                                       error:&err];
                 CVPixelBufferRelease(pixelBuffer);
 
-                if (!err && request.results.count > 0)
+                if (!err && request.results.count > 0 &&
+                    [request.results[0] isKindOfClass:[VNPixelBufferObservation class]])
                 {
                     VNPixelBufferObservation *obs =
                         (VNPixelBufferObservation *)request.results[0];
+                    if (!obs || !obs.pixelBuffer) { lastSeg = latest; continue; }
                     CVPixelBufferRef maskPB = obs.pixelBuffer;
 
                     CVPixelBufferLockBaseAddress(maskPB, kCVPixelBufferLock_ReadOnly);
