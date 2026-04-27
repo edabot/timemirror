@@ -347,19 +347,31 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
     else if (currentMode == "ad")
     {
         int centerX = width / 2;
-        // Precompute frame index per column, then copy row-by-row (cache-friendly)
         vector<int> colFrame(width);
         for (int x = 0; x < width; x++)
         {
             int dist = abs(x - centerX);
             colFrame[x] = (bufIdx - 1 - (dist * BUFFER_SIZE / max(centerX, 1)) + BUFFER_SIZE * 2) % BUFFER_SIZE;
         }
+        // Group consecutive columns with the same source frame into strips and
+        // parallelise over strips. Each strip reads one frame sequentially across
+        // all rows (~32 KB), fits in L1 and lets the hardware prefetcher work —
+        // much lower cache-miss cost than jumping across 200 frames per row.
+        struct Strip { int frame, x0, x1; }; // x1 is exclusive
+        vector<Strip> strips;
+        strips.reserve(BUFFER_SIZE * 2 + 2);
+        for (int i = 0, j; i < width; i = j) {
+            int f = colFrame[i];
+            for (j = i + 1; j < width && colFrame[j] == f; ++j) {}
+            strips.push_back({f, i, j});
+        }
 #pragma omp parallel for schedule(static)
-        for (int y = 0; y < height; y++)
+        for (int si = 0; si < (int)strips.size(); ++si)
         {
-            Vec3b *outRow = output.ptr<Vec3b>(y);
-            for (int x = 0; x < width; x++)
-                outRow[x] = frameBuffer[colFrame[x]].ptr<Vec3b>(y)[x];
+            const Strip& s = strips[si];
+            size_t off = (size_t)s.x0 * 3, nb = (size_t)(s.x1 - s.x0) * 3;
+            for (int y = 0; y < height; ++y)
+                memcpy(output.ptr(y) + off, frameBuffer[s.frame].ptr(y) + off, nb);
         }
     }
     else if (currentMode == "w")
@@ -385,12 +397,21 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
         vector<int> colFrame(width);
         for (int x = 0; x < width; x++)
             colFrame[x] = (bufIdx - ((width - 1 - x) * BUFFER_SIZE / width) + BUFFER_SIZE) % BUFFER_SIZE;
+        struct Strip { int frame, x0, x1; };
+        vector<Strip> strips;
+        strips.reserve(BUFFER_SIZE + 2);
+        for (int i = 0, j; i < width; i = j) {
+            int f = colFrame[i];
+            for (j = i + 1; j < width && colFrame[j] == f; ++j) {}
+            strips.push_back({f, i, j});
+        }
 #pragma omp parallel for schedule(static)
-        for (int y = 0; y < height; y++)
+        for (int si = 0; si < (int)strips.size(); ++si)
         {
-            Vec3b *outRow = output.ptr<Vec3b>(y);
-            for (int x = 0; x < width; x++)
-                outRow[x] = frameBuffer[colFrame[x]].ptr<Vec3b>(y)[x];
+            const Strip& s = strips[si];
+            size_t off = (size_t)s.x0 * 3, nb = (size_t)(s.x1 - s.x0) * 3;
+            for (int y = 0; y < height; ++y)
+                memcpy(output.ptr(y) + off, frameBuffer[s.frame].ptr(y) + off, nb);
         }
     }
     else if (currentMode == "d")
@@ -398,12 +419,21 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
         vector<int> colFrame(width);
         for (int x = 0; x < width; x++)
             colFrame[x] = (bufIdx - (x * BUFFER_SIZE / width) + BUFFER_SIZE) % BUFFER_SIZE;
+        struct Strip { int frame, x0, x1; };
+        vector<Strip> strips;
+        strips.reserve(BUFFER_SIZE + 2);
+        for (int i = 0, j; i < width; i = j) {
+            int f = colFrame[i];
+            for (j = i + 1; j < width && colFrame[j] == f; ++j) {}
+            strips.push_back({f, i, j});
+        }
 #pragma omp parallel for schedule(static)
-        for (int y = 0; y < height; y++)
+        for (int si = 0; si < (int)strips.size(); ++si)
         {
-            Vec3b *outRow = output.ptr<Vec3b>(y);
-            for (int x = 0; x < width; x++)
-                outRow[x] = frameBuffer[colFrame[x]].ptr<Vec3b>(y)[x];
+            const Strip& s = strips[si];
+            size_t off = (size_t)s.x0 * 3, nb = (size_t)(s.x1 - s.x0) * 3;
+            for (int y = 0; y < height; ++y)
+                memcpy(output.ptr(y) + off, frameBuffer[s.frame].ptr(y) + off, nb);
         }
     }
     else if (currentMode == "motion")
