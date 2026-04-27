@@ -102,7 +102,10 @@ float flowSensitivity = 10.0f;  // flow px/frame (small-scale) that maps to full
 Mat datamoshAccum;                 // CV_32FC3, signed accumulator
 Mat datamoshDiffF;                 // CV_32FC3 scratch for the per-frame diff
 float datamoshDecay = 0.92f;       // IIR decay per frame (higher = longer trails)
-const float DATAMOSH_BOOST = 1.5f; // diff amplification before accumulation
+// Boost scales inversely with (1-decay) to hold steady-state brightness constant:
+// boost = K*(1-decay), K derived from defaults (1.5/0.08 ≈ 18.75).
+// High trail life → low boost, so accum doesn't saturate to white.
+const float DATAMOSH_BOOST_K = 6.5625f;
 
 // Flow Ripple mode (J) — directional color that advects with optical flow and decays over ~1 second.
 // rippleBuffer holds accumulated per-pixel BGR color as float [0–255].
@@ -1071,8 +1074,9 @@ int main()
             int prev = (bufIdx - 1 - MOTION_LOOKBACK + BUFFER_SIZE * 2) % BUFFER_SIZE;
             cv::absdiff(frameBuffer[curr], frameBuffer[prev], diffMat);
             diffMat.convertTo(datamoshDiffF, CV_32FC3);
+            float datamoshBoost = DATAMOSH_BOOST_K * (1.0f - datamoshDecay);
             cv::addWeighted(datamoshAccum, datamoshDecay,
-                            datamoshDiffF, DATAMOSH_BOOST, 0.0, datamoshAccum);
+                            datamoshDiffF, datamoshBoost, 0.0, datamoshAccum);
         }
 
         // Update turbulence accumulator — used by turbulence mode.
@@ -1422,7 +1426,7 @@ int main()
             }
             else if (currentMode == "datamosh")
             {
-                datamoshDecay = min(0.98f, datamoshDecay + 0.02f);
+                datamoshDecay = min(0.992f, datamoshDecay + 0.02f); // 0.992 ≈ 1.5s half-life at 60fps
                 overlayText = "Trail: " + to_string((int)(datamoshDecay * 100));
             }
             else if (currentMode == "flowripple")
