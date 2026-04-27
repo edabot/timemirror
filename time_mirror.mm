@@ -188,10 +188,13 @@ void segmentLoop(int actualWidth, int actualHeight)
         request.qualityLevel = VNGeneratePersonSegmentationRequestQualityLevelFast;
         request.outputPixelFormat = kCVPixelFormatType_OneComponent8;
 
-        // VNSequenceRequestHandler is designed for video: reused across frames,
-        // maintains temporal state, and avoids per-frame GPU resource churn that
-        // causes VNImageRequestHandler to stall after extended use.
+        // VNSequenceRequestHandler accumulates internal temporal state each frame.
+        // After ~28 k frames (~8 min at 60 fps) that state exhausts GPU memory and
+        // performRequests hangs indefinitely. Reset every SEG_RESET_INTERVAL frames
+        // to flush accumulated state; -fobjc-arc ensures the old handler is released.
+        const int SEG_RESET_INTERVAL = 1800; // ~30 s at 60 fps
         VNSequenceRequestHandler *seqHandler = [[VNSequenceRequestHandler alloc] init];
+        int segFrameCount = 0;
 
         Mat bgraMat;
         int lastSeg = -1;
@@ -206,6 +209,8 @@ void segmentLoop(int actualWidth, int actualHeight)
             }
 
             @autoreleasepool {
+                if (++segFrameCount % SEG_RESET_INTERVAL == 0)
+                    seqHandler = [[VNSequenceRequestHandler alloc] init];
                 cv::cvtColor(frameBuffer[latest], bgraMat, COLOR_BGR2BGRA);
 
                 // Allocate a Vision-owned pixel buffer and copy the frame into it.

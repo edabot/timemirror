@@ -2,7 +2,7 @@ CXX        = g++
 SIGN_ID    = Developer ID Application: Edward Lewis (Z9B4288ZRX)
 ENTITLEMENTS = entitlements.plist
 OCV_LIBS   = -lopencv_core -lopencv_imgproc -lopencv_video -lopencv_videoio -lopencv_highgui
-CXXFLAGS   = -std=c++17 -O3 -march=native -Xpreprocessor -fopenmp \
+CXXFLAGS   = -std=c++17 -O3 -march=native -Xpreprocessor -fopenmp -fobjc-arc \
              -I$(shell brew --prefix libomp)/include \
              -I$(shell brew --prefix opencv)/include/opencv4
 LDFLAGS    = -L$(shell brew --prefix libomp)/lib -lomp \

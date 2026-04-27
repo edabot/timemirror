@@ -2,6 +2,14 @@
 
 ---
 
+## 2026-04-27 — Fix segmentation thread freeze after ~8 minutes
+
+### Fixed
+- **G/K image freezes after ~8 minutes regardless of spacing** — `VNSequenceRequestHandler` accumulates internal temporal state every frame; after ~28 k frames (~8 min at 60 fps) that state exhausts GPU memory and `performRequests` hangs indefinitely. Fix: reset the handler every 1800 frames (~30 s) to flush accumulated state.
+- **ObjC memory leak on handler reset** — without ARC, reassigning `seqHandler` leaked the old object. Added `-fobjc-arc` to `CXXFLAGS` so the old handler is released automatically on reassignment.
+
+---
+
 ## 2026-04-25 — Fix segmentation thread stall at high echo spacing
 
 ### Fixed
