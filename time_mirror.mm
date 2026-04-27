@@ -533,10 +533,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
     }
     else if (currentMode == "datamosh")
     {
-        // datamoshAccum is a CV_32FC3 float buffer updated by the preprocessing block.
-        // convertTo with CV_8UC3 saturates values above 255 to 255 — no manual clamping needed.
-        // Still areas: accum → 0 → black.  Moving areas: bright colour that decays over time.
-        datamoshAccum.convertTo(output, CV_8UC3);
+        // Output already written by the fused preprocessing loop — nothing to do here.
     }
     else if (currentMode == "ghostecho")
     {
@@ -1072,11 +1069,27 @@ int main()
         {
             int curr = (bufIdx - 1 + BUFFER_SIZE * 2) % BUFFER_SIZE;
             int prev = (bufIdx - 1 - MOTION_LOOKBACK + BUFFER_SIZE * 2) % BUFFER_SIZE;
-            cv::absdiff(frameBuffer[curr], frameBuffer[prev], diffMat);
-            diffMat.convertTo(datamoshDiffF, CV_32FC3);
             float datamoshBoost = DATAMOSH_BOOST_K * (1.0f - datamoshDecay);
-            cv::addWeighted(datamoshAccum, datamoshDecay,
-                            datamoshDiffF, datamoshBoost, 0.0, datamoshAccum);
+            // Fuse absdiff + convertTo + addWeighted + convertTo(output) into one pass.
+            // Eliminates datamoshDiffF scratch buffer and 3 extra full-frame traversals.
+#pragma omp parallel for schedule(static)
+            for (int y = 0; y < actualHeight; y++)
+            {
+                const uchar *currRow = frameBuffer[curr].ptr(y);
+                const uchar *prevRow = frameBuffer[prev].ptr(y);
+                float       *accumRow = datamoshAccum.ptr<float>(y);
+                uchar       *outRow   = output.ptr(y);
+                const int n = actualWidth * 3;
+                for (int i = 0; i < n; i++)
+                {
+                    float diff = (float)(currRow[i] > prevRow[i]
+                                         ? currRow[i] - prevRow[i]
+                                         : prevRow[i] - currRow[i]);
+                    float val = accumRow[i] * datamoshDecay + diff * datamoshBoost;
+                    accumRow[i] = val;
+                    outRow[i]   = val < 255.0f ? (uchar)val : 255;
+                }
+            }
         }
 
         // Update turbulence accumulator — used by turbulence mode.
