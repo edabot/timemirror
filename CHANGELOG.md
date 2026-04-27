@@ -2,6 +2,13 @@
 
 ---
 
+## 2026-04-27 — Fix Flow Direction Color (H) grayscale and Flow Ripple (J) no-color
+
+### Fixed
+- **H shows only grayscale / J shows no ripple color** — optical flow is computed at `FLOW_SCALE = 0.25×` resolution but after `cv::resize` back to full size the vector values remained in small-scale pixel units. `flowSensitivity = 10` was effectively "10px at 0.25× = 2.5px full-scale", making saturation near-zero (→ grayscale in H). The J mode injection threshold `mag < 0.5` was almost never met, so no color was ever injected. Fix: multiply `flowMap` by `1/FLOW_SCALE` after resize to convert vectors to full-resolution pixel units.
+
+---
+
 ## 2026-04-27 — Fix Datamosh (Y) black screen on entry
 
 ### Fixed

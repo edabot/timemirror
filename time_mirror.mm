@@ -1062,6 +1062,7 @@ int main()
             cv::calcOpticalFlowFarneback(prevGraySmall, currGraySmall, smallFlowBuf,
                                          0.5, 3, 15, 3, 5, 1.2, 0);
             cv::resize(smallFlowBuf, flowMap, flowMap.size());
+            flowMap *= (1.0f / FLOW_SCALE); // convert small-scale px → full-resolution px
         }
 
         // Update flow ripple buffer — advect, decay, inject — used by flowripple mode.
