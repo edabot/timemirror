@@ -594,26 +594,33 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
         for (int e = 0; e < TGHOST_ECHOES; e++)
             fi[e] = (base - e * tghostSpacing + BUFFER_SIZE * 10) % BUFFER_SIZE;
 
+        // Precompute per-echo fade (depends only on echo index, not on pixel)
+        float echoFade[TGHOST_ECHOES];
+        for (int e = 0; e < TGHOST_ECHOES; e++)
+            echoFade[e] = 0.30f + 0.70f * (1.0f - (float)e / (TGHOST_ECHOES - 1));
+
+        output.setTo(Scalar(0, 0, 0));
 #pragma omp parallel for schedule(static)
         for (int y = 0; y < height; y++)
         {
+            // Hoist row pointers outside x loop — eliminates 14*width redundant ptr() calls
+            const uchar *maskRows[TGHOST_ECHOES];
+            const Vec3b *frameRows[TGHOST_ECHOES];
+            for (int e = 0; e < TGHOST_ECHOES; e++) {
+                maskRows[e]  = maskBuffer[fi[e]].ptr<uchar>(y);
+                frameRows[e] = frameBuffer[fi[e]].ptr<Vec3b>(y);
+            }
             Vec3b *outRow = output.ptr<Vec3b>(y);
+            // Paint oldest→newest so newest echo wins at overlapping pixels.
             for (int x = 0; x < width; x++)
             {
-                outRow[x] = Vec3b(0, 0, 0);
-                // Paint oldest to newest so newest overwrites at current position.
-                // Soft mask alpha feathers edges; temporal fade dims older echoes.
                 for (int e = TGHOST_ECHOES - 1; e >= 0; e--)
                 {
-                    float maskAlpha = maskBuffer[fi[e]].ptr<uchar>(y)[x] / 255.0f;
-                    if (maskAlpha < 0.05f)
-                        continue;
-                    float fade = 0.30f + 0.70f * (1.0f - (float)e / (TGHOST_ECHOES - 1));
-                    float total = maskAlpha * fade;
-                    const Vec3b &p = frameBuffer[fi[e]].ptr<Vec3b>(y)[x];
-                    outRow[x][0] = (uchar)(p[0] * total);
-                    outRow[x][1] = (uchar)(p[1] * total);
-                    outRow[x][2] = (uchar)(p[2] * total);
+                    int alpha = maskRows[e][x];
+                    if (alpha < 13) continue; // 0.05 * 255
+                    float total = (alpha / 255.0f) * echoFade[e];
+                    const Vec3b &p = frameRows[e][x];
+                    outRow[x] = Vec3b((uchar)(p[0]*total), (uchar)(p[1]*total), (uchar)(p[2]*total));
                 }
             }
         }
@@ -679,24 +686,30 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
             }
         }
 
+        output.setTo(Scalar(0, 0, 0));
 #pragma omp parallel for schedule(static)
         for (int y = 0; y < height; y++)
         {
+            const uchar *maskRows[TGHOST_ECHOES];
+            const Vec3b *frameRows[TGHOST_ECHOES];
+            for (int e = 0; e < TGHOST_ECHOES; e++) {
+                maskRows[e]  = maskBuffer[fi[e]].ptr<uchar>(y);
+                frameRows[e] = frameBuffer[fi[e]].ptr<Vec3b>(y);
+            }
             Vec3b *outRow = output.ptr<Vec3b>(y);
             for (int x = 0; x < width; x++)
             {
-                outRow[x] = Vec3b(0, 0, 0);
                 for (int e = TGHOST_ECHOES - 1; e >= 0; e--)
                 {
-                    float maskAlpha = maskBuffer[fi[e]].ptr<uchar>(y)[x] / 255.0f;
-                    if (maskAlpha < 0.05f)
-                        continue;
-                    const Vec3b &p = frameBuffer[fi[e]].ptr<Vec3b>(y)[x];
-                    float lum = (0.114f * p[0] + 0.587f * p[1] + 0.299f * p[2]) / 255.0f;
-                    float brightness = lum * maskAlpha * 255.0f;
-                    outRow[x][0] = (uchar)min(255.0f, eB[e] * brightness);
-                    outRow[x][1] = (uchar)min(255.0f, eG[e] * brightness);
-                    outRow[x][2] = (uchar)min(255.0f, eR[e] * brightness);
+                    int alpha = maskRows[e][x];
+                    if (alpha < 13) continue;
+                    const Vec3b &p = frameRows[e][x];
+                    float brightness = (0.114f * p[0] + 0.587f * p[1] + 0.299f * p[2])
+                                       * (alpha / 255.0f);
+                    outRow[x] = Vec3b(
+                        (uchar)min(255.0f, eB[e] * brightness),
+                        (uchar)min(255.0f, eG[e] * brightness),
+                        (uchar)min(255.0f, eR[e] * brightness));
                 }
             }
         }
