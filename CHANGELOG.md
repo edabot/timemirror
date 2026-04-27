@@ -2,6 +2,20 @@
 
 ---
 
+## 2026-04-27 — Preprocessing thread, performance tuning, datamosh tuning
+
+### Added
+- **Preprocessing background thread** — motion map (M/X/E) and Farneback optical flow (H/J) now computed on a dedicated `preprocessLoop` thread. Uses double-buffered output mats (`motionMapBuf[2]`, `flowMapBuf[2]`) with an atomic `prepBuf` index so the main render thread always reads a completed result without blocking. Preprocessing overlaps with the previous frame's render+display, eliminating it from the serial render budget.
+- **`release.sh`** — one-command build script: runs `make notarize` and opens Finder to the result zip.
+
+### Changed
+- **Horizontal modes (A/D/AD) FPS: ~41 → ~48** — replaced pixel-by-pixel row loops with strip-parallel `memcpy`. Columns grouped into ~200 strips by source frame; OpenMP parallelises over strips so each strip reads sequentially from one frame (~32 KB, fits in L1) rather than thrashing cache across 200 frames per row.
+- **Ghost modes (G/K) faster** — hoisted `maskBuffer[fi[e]].ptr()` and `frameBuffer[fi[e]].ptr()` outside the x loop (were called per-pixel × 7 echoes = ~29M redundant pointer computations per frame). Echo fade factors precomputed outside the pixel loop.
+- **Datamosh (Y) fused into one OpenMP pass** — eliminated four separate OpenCV passes (absdiff → convertTo → addWeighted → convertTo) with a single parallel loop. Memory bandwidth roughly halved for this mode.
+- **Datamosh boost linked to decay** — `boost = DATAMOSH_BOOST_K × (1 − decay)` keeps steady-state brightness constant across trail lengths, preventing white saturation at high decay. `DATAMOSH_BOOST_K = 6.5625`. Trail ceiling raised 0.98 → 0.992 (~1.5 s half-life at 60 fps).
+
+---
+
 ## 2026-04-27 — Harden segmentation thread against crash on empty frame or unexpected Vision result
 
 ### Fixed

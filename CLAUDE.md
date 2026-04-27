@@ -2,6 +2,10 @@
 
 A real-time video effect that creates a "funhouse mirror" by displaying different horizontal or vertical strips from different moments in time, creating mesmerizing temporal distortions.
 
+## Workflow Notes
+
+- **Do not commit or push unless explicitly requested.** Make code changes and build to verify, then wait for the user to ask before running any git commands.
+
 ## Overview
 
 This project captures live webcam footage and applies a time-displacement effect where each line (row or column) of the output comes from a different frame in the past. The effect creates beautiful visual distortions as objects move through the frame.
@@ -36,20 +40,27 @@ This project captures live webcam footage and applies a time-displacement effect
 ### Architecture
 
 ```
-┌─────────────────────────────────┐   ┌──────────────────────────────────────┐
-│        Capture Thread           │   │             Main Thread              │
-│                                 │   │                                      │
-│  Camera Input (1920×1080)       │   │  Read writeIndex (atomic acquire)    │
-│      ↓                          │   │      ↓                               │
-│  Mirror Horizontally (flip)     │   │  Apply Time Displacement             │
-│      ↓                          │   │    (OpenMP parallel row/col copy)    │
-│  Write to frameBuffer[idx]      │   │      ↓                               │
-│      ↓                          │   │  Draw UI Overlays                    │
-│  Advance writeIndex (release)◄──┼───┼──────↓                               │
-│      ↓                          │   │  Display Output                      │
-│  (loop immediately)             │   │      ↓                               │
-│                                 │   │  Handle Keyboard Input               │
-└─────────────────────────────────┘   └──────────────────────────────────────┘
+┌──────────────────────┐  ┌─────────────────────────────┐  ┌──────────────────────────────┐
+│    Capture Thread    │  │    Preprocess Thread         │  │        Main Thread           │
+│                      │  │                              │  │                              │
+│  Camera (1920×1080)  │  │  Read writeIndex (acquire)   │  │  Read prepBuf (acquire)      │
+│       ↓              │  │       ↓                      │  │  motionMap = motionMapBuf[rb]│
+│  Mirror (flip)       │  │  Compute motion map (M/X/E)  │  │  flowMap   = flowMapBuf[rb]  │
+│       ↓              │  │  or optical flow (H/J)       │  │       ↓                      │
+│  frameBuffer[idx]    │  │  into motionMapBuf[writeBuf] │  │  Update turbulence/datamosh  │
+│       ↓              │  │  or    flowMapBuf[writeBuf]  │  │  Update ripple (J)           │
+│  writeIndex release ─┼──┤       ↓                      │  │       ↓                      │
+│  (loop immediately)  │  │  prepBuf.store(writeBuf) ────┼──→  applyTimeDisplacement()    │
+│                      │  │  (loop immediately)          │  │    (OpenMP parallel)         │
+└──────────────────────┘  └─────────────────────────────┘  │       ↓                      │
+                                                            │  Draw overlays / Display     │
+┌──────────────────────┐                                    │  Handle keyboard input       │
+│  Segment Thread      │                                    └──────────────────────────────┘
+│  (G/K modes only)    │
+│  Vision framework    │
+│  → maskBuffer        │
+│  → segReady release  │
+└──────────────────────┘
 ```
 
 ### Key Algorithms
@@ -79,9 +90,21 @@ This project captures live webcam footage and applies a time-displacement effect
 
 **Flow Direction Color Mode (H):**
 - Farneback optical flow computed at `FLOW_SCALE = 0.25` resolution, resized back up
+- Flow vectors multiplied by `1/FLOW_SCALE` after resize to convert to full-resolution pixel units
 - Per-pixel: `atan2(vy, vx)` → hue (direction encodes color), flow magnitude → saturation, pixel brightness → value
 - Converted HSV → BGR inline without creating intermediate Mat
 - Still areas produce desaturated output; motion reveals directional color
+
+**Horizontal Direction Modes (A/D/AD):**
+- Columns grouped into ~200 strips by source frame (each strip ~10 pixels wide at 1920px / 200 frames)
+- OpenMP parallelises over strips; each strip copies its column range across all rows with `memcpy`
+- Each strip accesses one frame sequentially (~32 KB, fits in L1 cache); hardware prefetcher works efficiently
+- Eliminated pixel-by-pixel loop that jumped across ~200 frame buffers per row (cache thrashing)
+
+**Datamosh (Y):**
+- Diff taken `MOTION_LOOKBACK` (10) frames apart — adjacent frames are near-zero at 60 fps
+- Boost = `DATAMOSH_BOOST_K × (1 − decay)` keeps steady-state accumulator brightness constant across decay settings
+- Fused into one OpenMP pass: diff + accumulate + clamp-to-output in a single loop, no intermediate buffers
 
 ## Features
 

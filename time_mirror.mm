@@ -76,11 +76,19 @@ atomic<int> writeIndex{0};
 atomic<int> updateSpeed{1};
 atomic<bool> running{true};
 
-// Motion mode working buffers — pre-allocated in main, used only in main thread
-Mat motionMap;   // CV_32F, 0.0 (still) → 1.0 (max motion), per-pixel
-Mat diffMat;     // CV_8UC3 scratch for absdiff
-Mat grayDiff;    // CV_8U  scratch for grayscale + blur
-Mat motionSmall; // CV_8U  scratch for motion blur at FLOW_SCALE resolution
+// Motion mode working buffers — pre-allocated in main
+Mat motionMap;      // CV_32F, shallow-copy alias into motionMapBuf[prepBuf] each frame
+Mat diffMat;        // CV_8UC3 scratch (main thread only)
+Mat grayDiff;       // CV_8U  scratch (main thread only)
+Mat motionSmall;    // CV_8U  scratch for motion blur at FLOW_SCALE resolution (main thread only)
+Mat turbScratch;    // CV_32F scratch for turbulence accumulation (replaces motionMap reuse)
+
+// Double-buffered preprocessing maps — written by preprocessLoop thread, read by main thread.
+// prepBuf is the buffer index safe to read; the thread writes to the opposite index.
+// Float-level data races on the handover frame are benign for a visual-art application.
+Mat motionMapBuf[2]; // CV_32F
+Mat flowMapBuf[2];   // CV_32FC2
+atomic<int> prepBuf{0};
 
 // Prismatic echo settings (runtime-adjustable with Up/Down in prismatic mode)
 int echoSpacing = 23; // Frames between each of 6 hue-tinted echoes (1 – BUFFER_SIZE/3)
@@ -88,12 +96,7 @@ int echoSpacing = 23; // Frames between each of 6 hue-tinted echoes (1 – BUFFE
 // Optical flow mode working buffers — pre-allocated in main
 // Flow is computed at FLOW_SCALE of full resolution for performance, then resized up.
 const float FLOW_SCALE = 0.25f; // compute flow at 1/4 linear resolution (~16x fewer pixels)
-Mat flowMap;                    // CV_32FC2, full-size interpolated flow vectors (vx, vy)
-Mat smallFlowBuf;               // CV_32FC2, flow at reduced resolution
-Mat smallPrevBGR;               // downscaled previous frame for flow input
-Mat smallCurrBGR;               // downscaled current frame for flow input
-Mat prevGraySmall;              // grayscale at small scale
-Mat currGraySmall;              // grayscale at small scale
+Mat flowMap;                    // CV_32FC2, shallow-copy alias into flowMapBuf[prepBuf] each frame
 float flowSensitivity = 10.0f;  // flow px/frame (small-scale) that maps to full time offset
 
 // Datamosh mode settings
@@ -292,6 +295,71 @@ void segmentLoop(int actualWidth, int actualHeight)
                 }
             }
         }
+    }
+}
+
+// ── Preprocessing thread ──────────────────────────────────────────────────────
+// Computes motion map (M/X/E) and optical flow (H/J) on a dedicated thread so
+// these sequential OpenCV operations overlap with the previous frame's render+display.
+// Writes into motionMapBuf[writeBuf] / flowMapBuf[writeBuf], then atomically advances
+// prepBuf so the main thread picks up the result on its next iteration.
+// All scratch buffers are private to this thread — no sharing with main thread.
+void preprocessLoop(int actualWidth, int actualHeight)
+{
+    const int smallW = max(1, (int)(actualWidth  * FLOW_SCALE));
+    const int smallH = max(1, (int)(actualHeight * FLOW_SCALE));
+
+    // Private scratch — never accessed by main thread
+    Mat pDiff(actualHeight, actualWidth, CV_8UC3);
+    Mat pGray(actualHeight, actualWidth, CV_8U);
+    Mat pSmall(smallH, smallW, CV_8U);
+    Mat pPrevBGR(smallH, smallW, CV_8UC3);
+    Mat pCurrBGR(smallH, smallW, CV_8UC3);
+    Mat pPrevGray(smallH, smallW, CV_8U);
+    Mat pCurrGray(smallH, smallW, CV_8U);
+    Mat pFlowSmall(smallH, smallW, CV_32FC2);
+
+    int lastPrepped = -1;
+    int writeBuf = 1; // start writing to buf 1 (render reads buf 0 initially)
+
+    while (running)
+    {
+        int latest = (writeIndex.load(memory_order_acquire) - 1 + BUFFER_SIZE) % BUFFER_SIZE;
+        if (latest == lastPrepped) { this_thread::yield(); continue; }
+
+        string mode = currentMode;
+
+        if (mode == "motion" || mode == "mchroma" || mode == "ghostecho")
+        {
+            int recent = latest;
+            int older  = (latest - MOTION_LOOKBACK + BUFFER_SIZE * 2) % BUFFER_SIZE;
+            cv::absdiff(frameBuffer[recent], frameBuffer[older], pDiff);
+            cv::cvtColor(pDiff, pGray, COLOR_BGR2GRAY);
+            cv::resize(pGray, pSmall, pSmall.size(), 0, 0, INTER_LINEAR);
+            cv::GaussianBlur(pSmall, pSmall, cv::Size(MOTION_BLUR_SIZE, MOTION_BLUR_SIZE), 0);
+            cv::resize(pSmall, pGray, pGray.size(), 0, 0, INTER_LINEAR);
+            pGray.convertTo(motionMapBuf[writeBuf], CV_32F, 1.0 / 255.0);
+            prepBuf.store(writeBuf, memory_order_release);
+            writeBuf = 1 - writeBuf;
+        }
+        else if (mode == "flowhue" || mode == "flowripple")
+        {
+            int recent = latest;
+            int older  = (latest - 1 + BUFFER_SIZE) % BUFFER_SIZE;
+            cv::resize(frameBuffer[older],  pPrevBGR,  pPrevBGR.size());
+            cv::resize(frameBuffer[recent], pCurrBGR,  pCurrBGR.size());
+            cv::cvtColor(pPrevBGR, pPrevGray, COLOR_BGR2GRAY);
+            cv::cvtColor(pCurrBGR, pCurrGray, COLOR_BGR2GRAY);
+            cv::calcOpticalFlowFarneback(pPrevGray, pCurrGray, pFlowSmall,
+                                         0.5, 3, 15, 3, 5, 1.2, 0);
+            cv::resize(pFlowSmall, flowMapBuf[writeBuf], flowMapBuf[writeBuf].size());
+            flowMapBuf[writeBuf] *= (1.0f / FLOW_SCALE);
+            prepBuf.store(writeBuf, memory_order_release);
+            writeBuf = 1 - writeBuf;
+        }
+        // Other modes need no map preprocessing — just note the frame as handled.
+
+        lastPrepped = latest;
     }
 }
 
@@ -956,21 +1024,21 @@ int main()
     // Pre-allocate output frame — reused every iteration, no per-frame heap alloc
     Mat output(actualHeight, actualWidth, CV_8UC3);
 
-    // Pre-allocate motion mode working buffers
-    motionMap = Mat::zeros(actualHeight, actualWidth, CV_32F);
-    diffMat = Mat::zeros(actualHeight, actualWidth, CV_8UC3);
-    grayDiff = Mat::zeros(actualHeight, actualWidth, CV_8U);
-
-    // Pre-allocate optical flow working buffers (computed at reduced resolution)
-    int flowW = max(1, (int)(actualWidth * FLOW_SCALE));
+    // Pre-allocate motion / flow working buffers (main thread scratch + double-buffered maps)
+    int flowW = max(1, (int)(actualWidth  * FLOW_SCALE));
     int flowH = max(1, (int)(actualHeight * FLOW_SCALE));
-    flowMap = Mat::zeros(actualHeight, actualWidth, CV_32FC2);
-    smallFlowBuf = Mat::zeros(flowH, flowW, CV_32FC2);
-    smallPrevBGR = Mat::zeros(flowH, flowW, CV_8UC3);
-    smallCurrBGR = Mat::zeros(flowH, flowW, CV_8UC3);
-    prevGraySmall = Mat::zeros(flowH, flowW, CV_8U);
-    currGraySmall = Mat::zeros(flowH, flowW, CV_8U);
+    diffMat    = Mat::zeros(actualHeight, actualWidth, CV_8UC3);
+    grayDiff   = Mat::zeros(actualHeight, actualWidth, CV_8U);
     motionSmall = Mat::zeros(flowH, flowW, CV_8U);
+    turbScratch = Mat::zeros(actualHeight, actualWidth, CV_32F);
+    // Double-buffered maps written by preprocessLoop, read by main thread
+    motionMapBuf[0] = Mat::zeros(actualHeight, actualWidth, CV_32F);
+    motionMapBuf[1] = Mat::zeros(actualHeight, actualWidth, CV_32F);
+    flowMapBuf[0]   = Mat::zeros(actualHeight, actualWidth, CV_32FC2);
+    flowMapBuf[1]   = Mat::zeros(actualHeight, actualWidth, CV_32FC2);
+    // Aliases that main thread updates each frame to point at the active buffer
+    motionMap = motionMapBuf[0];
+    flowMap   = flowMapBuf[0];
     cout << "Flow buffers: " << flowW << "x" << flowH << " (1/" << (int)(1 / FLOW_SCALE) << " scale)" << endl;
 
     // Pre-allocate datamosh working buffers
@@ -1023,6 +1091,7 @@ int main()
 
     // Start capture thread — decouples camera I/O from render loop
     thread captureThread(captureLoop, ref(cap));
+    thread prepThread(preprocessLoop, actualWidth, actualHeight);
 
     // Start segmentation thread — uses Vision framework (built into macOS 12+).
     // No subprocess or external dependencies required.
@@ -1046,18 +1115,13 @@ int main()
         // acquire: see all frameBuffer writes that happened before this index
         int bufIdx = writeIndex.load(memory_order_acquire);
 
-        // Build motion map — used by motion and mchroma modes
-        if (currentMode == "motion" || currentMode == "mchroma" || currentMode == "ghostecho")
+        // Update motionMap/flowMap aliases to the latest buffer from preprocessLoop.
+        // preprocessLoop runs concurrently and writes into motionMapBuf/flowMapBuf;
+        // prepBuf (atomic) tells us which buffer is safe to read.
         {
-            int recent = (bufIdx - 1 + BUFFER_SIZE * 2) % BUFFER_SIZE;
-            int older = (bufIdx - 1 - MOTION_LOOKBACK + BUFFER_SIZE * 2) % BUFFER_SIZE;
-            cv::absdiff(frameBuffer[recent], frameBuffer[older], diffMat);
-            cv::cvtColor(diffMat, grayDiff, COLOR_BGR2GRAY);
-            // Blur at FLOW_SCALE resolution (~16× fewer pixels) then upsample
-            cv::resize(grayDiff, motionSmall, motionSmall.size(), 0, 0, INTER_LINEAR);
-            cv::GaussianBlur(motionSmall, motionSmall, cv::Size(MOTION_BLUR_SIZE, MOTION_BLUR_SIZE), 0);
-            cv::resize(motionSmall, grayDiff, grayDiff.size(), 0, 0, INTER_LINEAR);
-            grayDiff.convertTo(motionMap, CV_32F, 1.0 / 255.0);
+            int rb = prepBuf.load(memory_order_acquire);
+            motionMap = motionMapBuf[rb]; // O(1) shallow header copy
+            flowMap   = flowMapBuf[rb];
         }
 
         // Update datamosh accumulator — used by datamosh mode.
@@ -1105,9 +1169,9 @@ int main()
             cv::GaussianBlur(motionSmall, motionSmall, cv::Size(MOTION_BLUR_SIZE, MOTION_BLUR_SIZE), 0);
             cv::resize(motionSmall, grayDiff, grayDiff.size(), 0, 0, INTER_LINEAR);
             cv::threshold(grayDiff, grayDiff, 20, 255, THRESH_TOZERO); // suppress camera noise
-            grayDiff.convertTo(motionMap, CV_32F, 0.5 / 255.0);        // reuse motionMap as scratch
+            grayDiff.convertTo(turbScratch, CV_32F, 0.5 / 255.0);
             turbulenceMap *= turbDecay;
-            cv::add(turbulenceMap, motionMap, turbulenceMap);
+            cv::add(turbulenceMap, turbScratch, turbulenceMap);
             cv::min(turbulenceMap, 1.0f, turbulenceMap);
             turbFrame++;
         }
@@ -1115,22 +1179,6 @@ int main()
         // Advance rainbow hue — used by rainbowghost mode.
         if (currentMode == "rainbowghost")
             rainbowHue = fmod(rainbowHue + rainbowSpeed / 60.0f, 360.0f);
-
-        // Compute optical flow — used by flowhue and flowripple modes.
-        // Farneback runs at FLOW_SCALE resolution then is resized up for speed.
-        if (currentMode == "flowhue" || currentMode == "flowripple")
-        {
-            int recent = (bufIdx - 1 + BUFFER_SIZE * 2) % BUFFER_SIZE;
-            int older = (bufIdx - 2 + BUFFER_SIZE * 2) % BUFFER_SIZE;
-            cv::resize(frameBuffer[older], smallPrevBGR, smallPrevBGR.size());
-            cv::resize(frameBuffer[recent], smallCurrBGR, smallCurrBGR.size());
-            cv::cvtColor(smallPrevBGR, prevGraySmall, COLOR_BGR2GRAY);
-            cv::cvtColor(smallCurrBGR, currGraySmall, COLOR_BGR2GRAY);
-            cv::calcOpticalFlowFarneback(prevGraySmall, currGraySmall, smallFlowBuf,
-                                         0.5, 3, 15, 3, 5, 1.2, 0);
-            cv::resize(smallFlowBuf, flowMap, flowMap.size());
-            flowMap *= (1.0f / FLOW_SCALE); // convert small-scale px → full-resolution px
-        }
 
         // Update flow ripple buffer — advect, decay, inject — used by flowripple mode.
         // 1. Build per-pixel backward-warp maps from flowMap.
@@ -1546,6 +1594,7 @@ int main()
 
     running = false;
     captureThread.join();
+    prepThread.join();
     segThread.join();
 
     cap.release();

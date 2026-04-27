@@ -102,13 +102,16 @@ saturation    = turbulenceMap[pixel] (motion = vivid colour)
 
 ### Y — Datamosh
 ```
-diffF = absdiff(frame[now], frame[now-1]) * DATAMOSH_BOOST (= 5×)
-datamoshAccum = datamoshAccum * datamoshDecay + diffF
+diff = absdiff(frame[now], frame[now - MOTION_LOOKBACK])
+boost = DATAMOSH_BOOST_K × (1 − datamoshDecay)   // linked so steady-state stays constant
+datamoshAccum = datamoshAccum × datamoshDecay + diff × boost
 Output = datamoshAccum clamped to [0, 255]
 ```
-- Default `datamoshDecay = 0.92` (~14 frame half-life at 60 fps)
-- Motion leaves bright colour trails that decay over time
-- Still areas fade to black
+- Default `datamoshDecay = 0.92` (~14 frame half-life at 60 fps); ceiling 0.992 (~1.5 s)
+- `DATAMOSH_BOOST_K = 6.5625` — boost scales down as decay increases to prevent white saturation
+- Diff taken `MOTION_LOOKBACK` (10) frames apart — adjacent frames are near-zero at 60 fps
+- Computed in one fused OpenMP pass (no intermediate buffers)
+- Motion leaves bright colour trails that decay over time; still areas fade to black
 
 ### E — Ghost Echo
 ```
