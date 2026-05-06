@@ -29,7 +29,7 @@ Row 0 (top) = current frame; row `height-1` = `BUFFER_SIZE` frames ago.
 
 ## Special Effect Modes
 
-### M — Motion Adaptive
+### Z — Motion Adaptive
 ```
 motionMap = GaussianBlur(absdiff(frame[now], frame[now - MOTION_LOOKBACK]))
 offset = motionMap[pixel] * updateSpeed * BUFFER_SIZE / height
@@ -39,7 +39,7 @@ offset = motionMap[pixel] * updateSpeed * BUFFER_SIZE / height
 - Moving pixels → larger temporal offset (more past)
 - Up/Down adjusts `updateSpeed`
 
-### C — Chromatic Time Shift
+### X — Chromatic Time Shift
 ```
 B channel ← frame[bufIdx - 1]
 G channel ← frame[bufIdx - 1 - chromaOffset]
@@ -48,7 +48,7 @@ R channel ← frame[bufIdx - 1 - chromaOffset * 2]
 - Fixed per-channel temporal split; `chromaOffset` = 3 frames (not runtime-adjustable)
 - Effect is uniform across the frame (no motion dependency)
 
-### X — Motion Chromatic
+### J — Motion Chromatic
 ```
 spread = motionMap[pixel] * chromaSpread
 B ← frame[bufIdx - 1]
@@ -60,7 +60,7 @@ R ← frame[bufIdx - 1 - spread * 2]
 - Moving pixels: full spread → vivid RGB temporal split
 - Up/Down adjusts `chromaSpread`
 
-### P — Prismatic Echo
+### T — Prismatic Echo
 ```
 6 echoes spaced echoSpacing frames apart
 Tint: Red → Yellow → Green → Cyan → Blue → Magenta
@@ -69,7 +69,7 @@ Output: average of 3 echoes per channel → no colour cast on still images
 - Default `echoSpacing = 23` frames
 - Up/Down adjusts `echoSpacing` (range: 1 – `BUFFER_SIZE/3`)
 
-### H — Flow Direction Color
+### K — Flow Direction Color
 ```
 Farneback optical flow at FLOW_SCALE (0.25×) resolution
 hue    = atan2(vy, vx)          (flow direction)
@@ -81,7 +81,7 @@ Output = HSV → BGR inline (no intermediate Mat)
 - Still pixels → desaturated (sat ≈ 0)
 - Up/Down adjusts `flowSensitivity`
 
-### J — Flow Color Ripple
+### Y — Flow Color Ripple
 ```
 Per-pixel hue assigned by flow direction; colour advects with flow vectors
 IIR decay: rippleBuffer = rippleBuffer * rippleDecay + newColour
@@ -89,7 +89,7 @@ IIR decay: rippleBuffer = rippleBuffer * rippleDecay + newColour
 - Default `rippleDecay = 0.93` (~1 second fade at 60 fps)
 - Colours persist and drift with motion; still areas fade to grey
 
-### N — Turbulence
+### I — Turbulence
 ```
 turbulenceMap = IIR accumulation of absdiff(frame[now], frame[now - MOTION_LOOKBACK])
 displacement  = turbulenceMap[pixel] * turbShift  (pixel offset into past frames)
@@ -100,7 +100,7 @@ saturation    = turbulenceMap[pixel] (motion = vivid colour)
 - Still areas: no displacement, desaturated
 - Moving areas: displaced + chromatic + saturated
 
-### Y — Datamosh
+### U — Datamosh
 ```
 diff = absdiff(frame[now], frame[now - MOTION_LOOKBACK])
 boost = DATAMOSH_BOOST_K × (1 − datamoshDecay)   // linked so steady-state stays constant
@@ -113,7 +113,7 @@ Output = datamoshAccum clamped to [0, 255]
 - Computed in one fused OpenMP pass (no intermediate buffers)
 - Motion leaves bright colour trails that decay over time; still areas fade to black
 
-### E — Ghost Echo
+### C — Ghost Echo
 ```
 7 echoes spaced ghostSpacing frames apart, masked by current motion mask
 Each echo composited with opacity 1/e (newest = full, oldest = faint)
@@ -123,7 +123,7 @@ Background = black
 - Uses the same `motionMap` as M/X modes
 - Up/Down adjusts `ghostSpacing`
 
-### G — Temporal Ghost
+### H — Temporal Ghost
 ```
 7 echoes spaced tghostSpacing frames apart
 Each echo uses maskBuffer[fi[e]] (Vision person mask) to isolate the subject
@@ -135,7 +135,7 @@ Background = black
 - `maskBuffer` gaps propagated to avoid stale masks from previous buffer wrap
 - Up/Down adjusts `tghostSpacing` (range: 1 – `BUFFER_SIZE / TGHOST_ECHOES`)
 
-### K — Rainbow Ghost
+### G — Rainbow Ghost
 ```
 7 echoes spaced tghostSpacing frames apart
 Each echo tinted a single hue spaced RAINBOW_HUE_STEP (45°) apart
@@ -144,12 +144,12 @@ rainbowHue advances rainbowSpeed (30 °/s) each frame so colors animate
 No temporal fade — all echoes rendered at full brightness (maskAlpha only)
 Background = black
 ```
-- Default `tghostSpacing = 20` frames (shared with G mode)
+- Default `tghostSpacing = 20` frames (shared with H mode)
 - Up/Down adjusts `tghostSpacing` (range: 1 – `BUFFER_SIZE / TGHOST_ECHOES`)
 
 ---
 
-## Segmentation subsystem (G, K modes)
+## Segmentation subsystem (H, G modes)
 
 Person segmentation uses `VNGeneratePersonSegmentationRequest` from Apple's Vision framework (macOS 12+). No Python, MediaPipe, or external model files required.
 

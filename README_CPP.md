@@ -66,19 +66,20 @@ Produces `TimeMirror_notarized.zip` — trusted by Gatekeeper on any Mac.
 
 | Key | Mode | Description |
 |-----|------|-------------|
-| **M** | Motion Adaptive | Displacement intensity scales with per-pixel motion |
-| **C** | Chromatic Time Shift | R/G/B channels pulled from slightly different frame offsets |
-| **X** | Motion Chromatic | Still areas = no color shift; moving areas = vivid RGB temporal split |
-| **P** | Prismatic Echo | 6 spectral echoes (red→magenta) spaced through the buffer; motion creates rainbow trails |
-| **H** | Flow Direction Color | Optical flow direction → hue, magnitude → saturation |
-| **J** | Flow Color Ripple | Directional color that advects with optical flow and decays over time |
-| **N** | Turbulence | Motion history drives displacement + chroma + saturation |
-| **Y** | Datamosh | IIR motion diff accumulation — moving subjects leave bright color trails |
-| **E** | Ghost Echo | 7 motion-masked temporal echoes composited on black |
-| **G** | Temporal Ghost | 7 person silhouettes at different moments in time, on black |
-| **K** | Rainbow Ghost | Like G but each echo tinted a cycling hue; color flows newest→oldest |
+| **T** | Prismatic Echo | 6 spectral echoes (red→magenta) spaced through the buffer; motion creates rainbow trails |
+| **Y** | Flow Color Ripple | Directional color that advects with optical flow and decays over time |
+| **U** | Datamosh | IIR motion diff accumulation — moving subjects leave bright color trails |
+| **I** | Turbulence | Motion history drives displacement + chroma + saturation |
+| **G** | Rainbow Ghost | Like H but each echo tinted a cycling hue; color flows newest→oldest |
+| **H** | Temporal Ghost | 7 person silhouettes at different moments in time, on black |
+| **J** | Motion Chromatic | Still areas = no color shift; moving areas = vivid RGB temporal split |
+| **K** | Flow Direction Color | Optical flow direction → hue, magnitude → saturation |
+| **Z** | Motion Adaptive | Displacement intensity scales with per-pixel motion |
+| **X** | Chromatic Time Shift | R/G/B channels pulled from slightly different frame offsets |
+| **C** | Ghost Echo | 7 motion-masked temporal echoes composited on black |
+| **V** | Background Removal | Isolate moving foreground on black |
 
-> **G and K modes** use Apple's Vision framework (built into macOS 12+) — no Python or MediaPipe required.
+> **G and H modes** use Apple's Vision framework (built into macOS 12+) — no Python or MediaPipe required.
 
 ### Other Controls
 

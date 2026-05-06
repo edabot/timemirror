@@ -64,7 +64,7 @@ int chromaSpread = 40; // Max frames between channels at full motion (0-motion =
 // Still areas → black. Moving subjects → layered ghost images from past frames.
 int ghostSpacing = 8; // Frames between each of 7 echoes (Up/Down adjustable)
 
-// Background Removal mode (B) — MOG2 Gaussian mixture background subtractor.
+// Background Removal mode (V) — MOG2 Gaussian mixture background subtractor.
 // Learns background automatically; only updates background model for background pixels,
 // so a stationary subject does not bleed into the background estimate over time.
 
@@ -933,27 +933,27 @@ string getModeName()
     if (currentMode == "ad")
         return "A+D: Center-Out Horizontal";
     if (currentMode == "motion")
-        return "M: Motion Adaptive";
+        return "Z: Motion Adaptive";
     if (currentMode == "chroma")
-        return "C: Chromatic Time Shift";
+        return "X: Chromatic Time Shift";
     if (currentMode == "mchroma")
-        return "X: Motion Chromatic";
+        return "J: Motion Chromatic";
     if (currentMode == "prismatic")
-        return "P: Prismatic Echo";
+        return "T: Prismatic Echo";
     if (currentMode == "flowhue")
-        return "H: Flow Direction Color";
+        return "K: Flow Direction Color";
     if (currentMode == "flowripple")
-        return "J: Flow Color Ripple";
+        return "Y: Flow Color Ripple";
     if (currentMode == "datamosh")
-        return "Y: Datamosh";
+        return "U: Datamosh";
     if (currentMode == "ghostecho")
-        return "E: Ghost Echo";
+        return "C: Ghost Echo";
     if (currentMode == "timeghost")
-        return "G: Temporal Ghost";
+        return "H: Temporal Ghost";
     if (currentMode == "rainbowghost")
-        return "K: Rainbow Ghost";
+        return "G: Rainbow Ghost";
     if (currentMode == "turbulence")
-        return "N: Turbulence";
+        return "I: Turbulence";
     return "Unknown";
 }
 
@@ -1072,16 +1072,18 @@ int main()
     cout << "  W+S or A+D   - Combo modes (press within 0.5s)" << endl;
     cout << "  M            - Motion adaptive mode" << endl;
     cout << "  C            - Chromatic time shift mode" << endl;
-    cout << "  X            - Motion chromatic (still=normal, moving=RGB time split)" << endl;
-    cout << "  P            - Prismatic echo (6 hue-tinted temporal echoes)" << endl;
-    cout << "  H            - Flow direction color (direction→hue, speed→saturation)" << endl;
-    cout << "  J            - Flow color ripple (directional color that lingers and drifts)" << endl;
-    cout << "  N            - Turbulence (motion history → displacement + chroma + saturation)" << endl;
-    cout << "  Y            - Datamosh (motion trails via IIR diff accumulation)" << endl;
-    cout << "  E            - Ghost Echo (7 motion-masked temporal echoes on black)" << endl;
-    cout << "  B            - Background Removal (isolate moving foreground on black)" << endl;
-    cout << "  G            - Temporal Ghost (7 person silhouettes through time on black)" << endl;
-    cout << "  K            - Rainbow Ghost (like G but echoes tinted with cycling hues)" << endl;
+    cout << "  T            - Prismatic echo (6 hue-tinted temporal echoes)" << endl;
+    cout << "  Y            - Flow color ripple (directional color that lingers and drifts)" << endl;
+    cout << "  U            - Datamosh (motion trails via IIR diff accumulation)" << endl;
+    cout << "  I            - Turbulence (motion history → displacement + chroma + saturation)" << endl;
+    cout << "  G            - Rainbow Ghost (like H but echoes tinted with cycling hues)" << endl;
+    cout << "  H            - Temporal Ghost (7 person silhouettes through time on black)" << endl;
+    cout << "  J            - Motion chromatic (still=normal, moving=RGB time split)" << endl;
+    cout << "  K            - Flow direction color (direction→hue, speed→saturation)" << endl;
+    cout << "  Z            - Motion Adaptive" << endl;
+    cout << "  X            - Chromatic Time Shift" << endl;
+    cout << "  C            - Ghost Echo (7 motion-masked temporal echoes on black)" << endl;
+    cout << "  V            - Background Removal (isolate moving foreground on black)" << endl;
     cout << "  Up/Down      - Speed / Chroma / Flow sens / Spread / Echo / Band ht" << endl;
     cout << "  R            - Reset the above to defaults" << endl;
     cout << "  F            - Toggle fullscreen" << endl;
@@ -1326,61 +1328,61 @@ int main()
             currentMode = checkForCombo('d');
             cout << "Mode: " << getModeName() << endl;
         }
-        else if (key == 'm')
+        else if (key == 'z')
         {
             currentMode = "motion";
             cout << "Mode: " << getModeName() << endl;
         }
-        else if (key == 'c')
+        else if (key == 'x')
         {
             currentMode = "chroma";
             cout << "Mode: " << getModeName() << endl;
         }
-        else if (key == 'x')
+        else if (key == 'j')
         {
             currentMode = "mchroma";
             cout << "Mode: " << getModeName() << endl;
         }
-        else if (key == 'p')
+        else if (key == 't')
         {
             currentMode = "prismatic";
             cout << "Mode: " << getModeName() << endl;
         }
-        else if (key == 'h')
+        else if (key == 'k')
         {
             currentMode = "flowhue";
             cout << "Mode: " << getModeName() << endl;
         }
-        else if (key == 'j')
+        else if (key == 'y')
         {
             currentMode = "flowripple";
             rippleBuffer.setTo(0); // clear lingering state on entry
             cout << "Mode: " << getModeName() << endl;
         }
-        else if (key == 'n')
+        else if (key == 'i')
         {
             currentMode = "turbulence";
             turbulenceMap.setTo(0);
             turbFrame = 0;
             cout << "Mode: " << getModeName() << endl;
         }
-        else if (key == 'y')
+        else if (key == 'u')
         {
             currentMode = "datamosh";
             datamoshAccum.setTo(0); // fresh slate each entry
             cout << "Mode: " << getModeName() << endl;
         }
-        else if (key == 'e')
+        else if (key == 'c')
         {
             currentMode = "ghostecho";
             cout << "Mode: " << getModeName() << endl;
         }
-        else if (key == 'g')
+        else if (key == 'h')
         {
             currentMode = "timeghost";
             cout << "Mode: " << getModeName() << endl;
         }
-        else if (key == 'k')
+        else if (key == 'g')
         {
             currentMode = "rainbowghost";
             cout << "Mode: " << getModeName() << endl;

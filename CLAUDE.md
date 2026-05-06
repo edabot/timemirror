@@ -45,10 +45,10 @@ This project captures live webcam footage and applies a time-displacement effect
 │                      │  │                              │  │                              │
 │  Camera (1920×1080)  │  │  Read writeIndex (acquire)   │  │  Read prepBuf (acquire)      │
 │       ↓              │  │       ↓                      │  │  motionMap = motionMapBuf[rb]│
-│  Mirror (flip)       │  │  Compute motion map (M/X/E)  │  │  flowMap   = flowMapBuf[rb]  │
-│       ↓              │  │  or optical flow (H/J)       │  │       ↓                      │
+│  Mirror (flip)       │  │  Compute motion map (Z/J/C)  │  │  flowMap   = flowMapBuf[rb]  │
+│       ↓              │  │  or optical flow (K/Y)       │  │       ↓                      │
 │  frameBuffer[idx]    │  │  into motionMapBuf[writeBuf] │  │  Update turbulence/datamosh  │
-│       ↓              │  │  or    flowMapBuf[writeBuf]  │  │  Update ripple (J)           │
+│       ↓              │  │  or    flowMapBuf[writeBuf]  │  │  Update ripple (Y)           │
 │  writeIndex release ─┼──┤       ↓                      │  │       ↓                      │
 │  (loop immediately)  │  │  prepBuf.store(writeBuf) ────┼──→  applyTimeDisplacement()    │
 │                      │  │  (loop immediately)          │  │    (OpenMP parallel)         │
@@ -56,7 +56,7 @@ This project captures live webcam footage and applies a time-displacement effect
                                                             │  Draw overlays / Display     │
 ┌──────────────────────┐                                    │  Handle keyboard input       │
 │  Segment Thread      │                                    └──────────────────────────────┘
-│  (G/K modes only)    │
+│  (H/G modes only)    │
 │  Vision framework    │
 │  → maskBuffer        │
 │  → segReady release  │
@@ -75,20 +75,20 @@ This project captures live webcam footage and applies a time-displacement effect
 - Top/Bottom edges = oldest frames
 - Radial time gradient from center
 
-**Motion Chromatic Mode (X):**
+**Motion Chromatic Mode (J):**
 - Per-frame: `absdiff` between current and `MOTION_LOOKBACK` frames ago → Gaussian blur → CV_32F motionMap (0–1)
 - Per-pixel: motion value scales a `chromaSpread` offset (default 20 frames)
 - Blue channel pulled from `idx - spread`, Green from `idx`, Red from `idx + spread`
 - Still pixels: all three channels from same frame → no color shift
 - Moving pixels: full `chromaSpread` offset → vivid RGB split
 
-**Prismatic Echo Mode (P):**
+**Prismatic Echo Mode (T):**
 - 6 temporal echoes, spaced `echoSpacing` frames apart (default 15)
 - Each echo is tinted with a spectral color: Red → Yellow → Green → Cyan → Blue → Magenta
 - Output averages 3 echoes per channel, so still images reproduce faithfully with no color cast
 - Moving subjects: echoes separate in time → rainbow trails follow motion
 
-**Flow Direction Color Mode (H):**
+**Flow Direction Color Mode (K):**
 - Farneback optical flow computed at `FLOW_SCALE = 0.25` resolution, resized back up
 - Flow vectors multiplied by `1/FLOW_SCALE` after resize to convert to full-resolution pixel units
 - Per-pixel: `atan2(vy, vx)` → hue (direction encodes color), flow magnitude → saturation, pixel brightness → value
@@ -101,7 +101,7 @@ This project captures live webcam footage and applies a time-displacement effect
 - Each strip accesses one frame sequentially (~32 KB, fits in L1 cache); hardware prefetcher works efficiently
 - Eliminated pixel-by-pixel loop that jumped across ~200 frame buffers per row (cache thrashing)
 
-**Datamosh (Y):**
+**Datamosh (U):**
 - Diff taken `MOTION_LOOKBACK` (10) frames apart — adjacent frames are near-zero at 60 fps
 - Boost = `DATAMOSH_BOOST_K × (1 − decay)` keeps steady-state accumulator brightness constant across decay settings
 - Fused into one OpenMP pass: diff + accumulate + clamp-to-output in a single loop, no intermediate buffers
@@ -119,14 +119,18 @@ This project captures live webcam footage and applies a time-displacement effect
 - **A+D** - Center-out horizontal (press A then D within 0.5s)
 
 ### Special Effect Modes
-- **M** - Motion Adaptive (displacement intensity scales with per-pixel motion)
-- **C** - Chromatic Aberration (R/G/B channels pulled from slightly different frames)
-- **X** - Motion Chromatic (motion-driven per-pixel RGB temporal split; still=no color, moving=full chroma spread)
-- **P** - Prismatic Echo (6 spectral echoes spaced through the buffer; moving subjects leave rainbow trails)
-- **H** - Flow Direction Color (optical flow direction → hue, magnitude → saturation; directional color from motion)
-- **N** - Turbulence (motion history accumulation drives pixel displacement + chroma split + saturation boost)
-- **G** - Temporal Ghost (7 person echoes through time on black; uses Apple Vision framework, no Python needed)
-- **K** - Rainbow Ghost (like G but each echo tinted a cycling hue; color flows newest→oldest; no temporal fade)
+- **T** - Prismatic Echo (6 spectral echoes spaced through the buffer; moving subjects leave rainbow trails)
+- **Y** - Flow Color Ripple (directional color that advects with optical flow and decays over time)
+- **U** - Datamosh (IIR motion diff accumulation — moving subjects leave bright color trails)
+- **I** - Turbulence (motion history accumulation drives pixel displacement + chroma split + saturation boost)
+- **G** - Rainbow Ghost (like H but each echo tinted a cycling hue; color flows newest→oldest; no temporal fade)
+- **H** - Temporal Ghost (7 person echoes through time on black; uses Apple Vision framework, no Python needed)
+- **J** - Motion Chromatic (motion-driven per-pixel RGB temporal split; still=no color, moving=full chroma spread)
+- **K** - Flow Direction Color (optical flow direction → hue, magnitude → saturation; directional color from motion)
+- **Z** - Motion Adaptive (displacement intensity scales with per-pixel motion)
+- **X** - Chromatic Time Shift (R/G/B channels pulled from slightly different frames)
+- **C** - Ghost Echo (7 motion-masked temporal echoes composited on black)
+- **V** - Background Removal (isolate moving foreground on black)
 
 ### Controls
 - **Arrow Up/Down** - Adjust speed (lines per frame)
@@ -324,11 +328,11 @@ Main thread (render loop):
 - Startup log shows OpenMP thread count for verification
 
 ### C++ Version (v3 — Special Effect Modes)
-- **M: Motion Adaptive** — per-pixel motion map (absdiff + Gaussian blur) drives displacement intensity
-- **C: Chromatic Aberration** — R/G/B channels pulled from slightly different frame offsets
-- **X: Motion Chromatic** — motion map scales per-pixel RGB channel temporal split; still areas show no color, moving areas show vivid chromatic split
-- **P: Prismatic Echo** — 6 spectral echoes (red/yellow/green/cyan/blue/magenta) spaced through buffer; still images reproduce faithfully, motion creates rainbow trails
-- **H: Flow Direction Color** — Farneback optical flow direction mapped to hue, magnitude to saturation; directional color reveals motion flow patterns
+- **Z: Motion Adaptive** — per-pixel motion map (absdiff + Gaussian blur) drives displacement intensity
+- **X: Chromatic Time Shift** — R/G/B channels pulled from slightly different frame offsets
+- **J: Motion Chromatic** — motion map scales per-pixel RGB channel temporal split; still areas show no color, moving areas show vivid chromatic split
+- **T: Prismatic Echo** — 6 spectral echoes (red/yellow/green/cyan/blue/magenta) spaced through buffer; still images reproduce faithfully, motion creates rainbow trails
+- **K: Flow Direction Color** — Farneback optical flow direction mapped to hue, magnitude to saturation; directional color reveals motion flow patterns
 
 ## Modes Tried and Dropped
 
@@ -341,7 +345,7 @@ These modes were implemented and tested but removed after evaluation.
 
 ### U: Motion Hue Rotation
 - **Approach:** Motion intensity rotated per-pixel hue in HSV space; high-motion pixels shifted more
-- **Why dropped:** Visually interesting but not as compelling as Prismatic Echo or Flow Direction Color. Dropped when user chose P and H as the two keepers from a batch of five new modes.
+- **Why dropped:** Visually interesting but not as compelling as Prismatic Echo or Flow Direction Color. Dropped when user chose T and K as the two keepers from a batch of five new modes.
 
 ### G: Temporal Hue Gradient
 - **Approach:** Each frame in the buffer assigned a hue based on its age; output pixels tinted by the hue of the frame they were drawn from
@@ -375,9 +379,9 @@ These modes were implemented and tested but removed after evaluation.
 ### Mode Ideas (Not Yet Implemented)
 - [ ] **Long Exposure** — accumulate N frames with equal weight; moving subjects blur into streaks, still areas stay sharp
 - [ ] **Echo Ghost** — overlay current frame with 3-5 semi-transparent older frames; sharp ghost images rather than blurred trails
-- [ ] **Directional Chroma** — like X (Motion Chromatic) but channel split direction follows motion direction (horizontal motion → horizontal split, vertical → vertical)
+- [ ] **Directional Chroma** — like J (Motion Chromatic) but channel split direction follows motion direction (horizontal motion → horizontal split, vertical → vertical)
 - [ ] **Angle Clock** — divide frame into radial sectors; each sector sweeps through time like a clock hand, sectors at different angles show different moments
-- ~~**Scan Glitch**~~ Removed — replaced by Turbulence (N)
+- ~~**Scan Glitch**~~ Removed — replaced by Turbulence (I)
 
 ### Performance Ideas
 - Shader-based implementation (OpenGL/Metal)
