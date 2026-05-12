@@ -118,22 +118,19 @@ This project captures live webcam footage and applies a time-displacement effect
 - **W+S** - Center-out vertical (press W then S within 0.5s)
 - **A+D** - Center-out horizontal (press A then D within 0.5s)
 
-### Special Effect Modes
-- **T** - Prismatic Echo (6 spectral echoes spaced through the buffer; moving subjects leave rainbow trails)
-- **Y** - Flow Color Ripple (directional color that advects with optical flow and decays over time)
+### Special Effect Modes (many keys toggle between two related variants)
+- **T** - Prismatic Echo / Prismatic Ghost (press again to toggle): Echo=spectral hue-tinted buffer echoes; Ghost=Vision masks + additive glow + radial ring backdrop
+- **Y** - Flow Color Ripple / Flow Direction Color (toggle): Ripple=color advects with flow; Direction=flow dir→hue, mag→sat
 - **U** - Datamosh (IIR motion diff accumulation — moving subjects leave bright color trails)
 - **I** - Turbulence (motion history accumulation drives pixel displacement + chroma split + saturation boost)
-- **G** - Rainbow Ghost (like H but each echo tinted a cycling hue; color flows newest→oldest; no temporal fade)
-- **H** - Temporal Ghost (7 person echoes through time on black; uses Apple Vision framework, no Python needed)
+- **G** - Rainbow Ghost / Tunnel Ghost (toggle): Rainbow=flat cycling-hue person echoes; Tunnel=same but older echoes zoomed
+- **H** - Temporal Ghost / Tunnel Time Ghost (toggle): natural-color person echoes; alt=same with tunnel zoom scaling
 - **J** - Motion Chromatic (motion-driven per-pixel RGB temporal split; still=no color, moving=full chroma spread)
-- **K** - Flow Direction Color (optical flow direction → hue, magnitude → saturation; directional color from motion)
+- **K** - Wave Warp / Chroma Wave (toggle): Wave=2D sim refracts full frame; Chroma=3 independent per-channel waves
 - **Z** - Motion Adaptive (displacement intensity scales with per-pixel motion)
 - **X** - Chromatic Time Shift (R/G/B channels pulled from slightly different frames)
-- **C** - Ghost Echo (7 motion-masked temporal echoes composited on black)
+- **C** - Ghost Echo / Chroma Ghost Echo (toggle): Echo=motion-masked weighted blend; Chroma=same with cycling hue tints
 - **V** - Flow Warp (optical flow displaces live camera; motion warps the image)
-- **N** - Wave Warp (2D wave simulation seeded by motion; gradients refract full frame)
-- **M** - Chroma Wave (three independent waves per RGB channel; per-channel chromatic refraction)
-- **B** - Tunnel Ghost (rainbow ghost echoes zoomed in; oldest echo largest, creating an expanding tunnel)
 
 ### Controls
 - **Arrow Up/Down** - Adjust speed (lines per frame)

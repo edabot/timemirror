@@ -113,65 +113,53 @@ Output = datamoshAccum clamped to [0, 255]
 - Computed in one fused OpenMP pass (no intermediate buffers)
 - Motion leaves bright colour trails that decay over time; still areas fade to black
 
-### C — Ghost Echo
+### C — Ghost Echo / Chroma Ghost Echo (toggle)
 ```
 7 echoes spaced ghostSpacing frames apart, masked by current motion mask
-Each echo composited with opacity 1/e (newest = full, oldest = faint)
+Ghost Echo:       weighted blend (newest = brightest); natural colour
+Chroma Ghost Echo: per-echo luma × cycling hue tint; additive blend; rainbowHue advances each frame
 Background = black
 ```
-- Default `ghostSpacing = 8` frames
-- Uses the same `motionMap` as M/X modes
-- Up/Down adjusts `ghostSpacing`
+- Default `ghostSpacing = 8` frames; Up/Down adjusts (shared between both variants)
+- `rainbowHue` cycles at `rainbowSpeed` (30 °/s) in Chroma Ghost Echo
 
-### H — Temporal Ghost
+### H — Temporal Ghost / Tunnel Time Ghost (toggle)
 ```
-7 echoes spaced tghostSpacing frames apart
-Each echo uses maskBuffer[fi[e]] (Vision person mask) to isolate the subject
-Fade: oldest = 30% brightness, newest = 100%
-Background = black
+7 echoes spaced tghostSpacing frames apart; Vision person masks; fade oldest=30%→newest=100%
+Temporal Ghost:    flat (all echoes full-frame)
+Tunnel Time Ghost: s[e] = 1 + (tunnelScale−1)×e/(N−1); older echoes zoomed in
 ```
-- Default `tghostSpacing = 20` frames
-- `segReady` used as base (never `bufIdx-1`) to avoid data race with segment thread
-- `maskBuffer` gaps propagated to avoid stale masks from previous buffer wrap
-- Up/Down adjusts `tghostSpacing` (range: 1 – `BUFFER_SIZE / TGHOST_ECHOES`)
+- Default `tghostSpacing = 20`; Up/Down adjusts spacing in both variants
+- `segReady` used as base to avoid data race; `maskBuffer` gaps propagated
 
-### G — Rainbow Ghost
+### G — Rainbow Ghost / Tunnel Ghost (toggle)
 ```
-7 echoes spaced tghostSpacing frames apart
-Each echo tinted a single hue spaced RAINBOW_HUE_STEP (45°) apart
-Hue assigned newest→oldest: echo 0 = rainbowHue, echo 1 = rainbowHue - 45°, …
-rainbowHue advances rainbowSpeed (30 °/s) each frame so colors animate
-No temporal fade — all echoes rendered at full brightness (maskAlpha only)
-Background = black
+7 echoes; each tinted a hue RAINBOW_HUE_STEP (45°) apart; rainbowHue cycles at 30°/s
+Rainbow Ghost: flat (all echoes full-frame)
+Tunnel Ghost:  s[e] = 1 + (tunnelScale−1)×e/(N−1); Up/Down adjusts tunnelScale (1.2–8.0)
 ```
-- Default `tghostSpacing = 20` frames (shared with H mode)
-- Up/Down adjusts `tghostSpacing` (range: 1 – `BUFFER_SIZE / TGHOST_ECHOES`)
+- Default `tghostSpacing = 20` (shared with H); `tunnelScale = 3.0`
 
-### B — Tunnel Ghost
+### T — Prismatic Echo / Prismatic Ghost (toggle)
 ```
-s[e]      = 1.0 + (tunnelScale − 1.0) × e / (TGHOST_ECHOES − 1)
-inv_s[e]  = 1 / s[e]
-src_x = cx + (x − cx) × inv_s[e]      (per-pixel, per-echo)
-src_y = cy + (y − cy) × inv_s[e]      (per-row, per-echo — hoisted)
+Prismatic Echo:   6 echoes × echoSpacing frames; tinted Red→Yellow→Green→Cyan→Blue→Magenta
+                  3 echoes averaged per channel → no colour cast on still images
+Prismatic Ghost:  7 Vision person-mask echoes; hue-tinted (cycling rainbowHue); additive blend
+                  glow = sqrtf(alpha) × lum × glowBoost
+                  Ring backdrop: brightness = (dist/maxDist) × 35  (black at centre, dim at corners)
 ```
-- Newest echo (e=0): s=1.0, full-frame (inv_s=1.0, no zoom)
-- Oldest echo (e=6): s=tunnelScale, zoomed in (inv_s<1.0, samples a centre crop — person appears larger than frame)
-- Rendered back-to-front so nearest (fullest) echo paints last
-- Same rainbow hue palette as G mode; `rainbowHue` advances at `rainbowSpeed`
-- Default `tunnelScale = 3.0` (oldest echo 3× zoomed)
-- Up/Down adjusts `tunnelScale` (range: 1.2 – 8.0, step 0.5)
-- `tghostSpacing` shared with G/H modes for echo frame spacing
+- Prismatic Echo: Up/Down adjusts `echoSpacing` (1 – `BUFFER_SIZE/3`, default 23)
+- Prismatic Ghost: Up/Down adjusts `glowBoost` (0.25 – 6.0, default 0.5)
 
-### Expanding ring backdrop (H, G, B modes)
+### Expanding ring backdrop (H, G ghost modes)
 ```
 dist  = sqrt((x − cx)² + (y − cy)²)
 phase = fmod(dist − ringOffset, RING_SPACING)
-pixel = 35 if phase < RING_SPACING/2 else 0   (dark gray / black alternation)
+pixel = 35 if phase < RING_SPACING/2 else 0   (uniform gray / black)
 ringOffset advances RING_SPEED/60 px per frame
 ```
-- `RING_SPEED = 75` px/s; `RING_SPACING = 200` px between ring centres
-- Background drawn first; person echoes composited on top
-- `dy²` hoisted per row; only `sqrtf` computed per pixel
+Prismatic Ghost variant: `pixel = (dist/maxDist) × 35` for light sections (radial ramp, black at centre)
+- `RING_SPEED = 75` px/s; `RING_SPACING = 200` px; `dy²` hoisted per row
 
 ---
 

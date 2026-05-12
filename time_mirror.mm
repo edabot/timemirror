@@ -79,9 +79,12 @@ const float WAVE_SEED = 3.0f;  // motion map intensity seeded into wave per fram
 
 // Chroma Wave mode (M) — three independent wave simulations, one per RGB channel.
 // Each wave is seeded from its own colour channel's absdiff so R/G/B motion drives
-// independent wave patterns; each channel's gradient displaces only that channel's sample.
+// independent wave patterns; each channel's displacement is rotated 120° apart so
+// even similar wave shapes produce vivid colour separation in different spatial directions.
 Mat waveAr, waveBr, waveAg, waveBg, waveAb, waveBb; // per-channel double buffers
-float chromaWaveRefract = 15.0f; // gradient amplification per channel (Up/Down adjustable)
+float chromaWaveRefract = 30.0f; // gradient amplification per channel (Up/Down adjustable)
+const float CWAVE_DAMP = 0.985f; // less decay than N → bigger sustained waves
+const float CWAVE_SEED = 8.0f;   // stronger injection than N → larger amplitudes
 
 
 // Shared between capture thread and main thread.
@@ -159,7 +162,8 @@ const int TGHOST_ECHOES = 7;
 float rainbowHue = 0.0f;         // G/B mode: current base hue (0–360, cycles each frame)
 float rainbowSpeed = 30.0f;      // G/B mode: degrees per second the hue advances
 const int RAINBOW_HUE_STEP = 45; // degrees between consecutive echoes
-float tunnelScale = 3.0f;        // B mode: scale of oldest echo (1.0=flat, higher=deeper tunnel)
+float tunnelScale = 3.0f;        // tunnel ghost modes: scale of oldest echo
+float glowBoost   = 0.5f;        // B mode: glow brightness multiplier (Up/Down adjustable)
 float ringOffset = 0.0f;         // G mode: expanding ring backdrop phase (px, advances each frame)
 const float RING_SPACING = 200.0f; // px between ring centres (period of gray/black alternation)
 const float RING_SPEED   = 75.0f;  // px/s ring expansion speed
@@ -349,7 +353,7 @@ void preprocessLoop(int actualWidth, int actualHeight)
 
         string mode = currentMode;
 
-        if (mode == "motion" || mode == "mchroma" || mode == "ghostecho" || mode == "wavewarp")
+        if (mode == "motion" || mode == "mchroma" || mode == "ghostecho" || mode == "chromaghostecho" || mode == "wavewarp")
         {
             int recent = latest;
             int older  = (latest - MOTION_LOOKBACK + BUFFER_SIZE * 2) % BUFFER_SIZE;
@@ -662,6 +666,136 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
             }
         }
     }
+    else if (currentMode == "chromaghostecho")
+    {
+        // Ghost Echo variant: each echo tinted a cycling hue (like Rainbow Ghost but motion-masked).
+        // Per-echo luma × hue replaces the neutral weighted blend; rainbowHue cycles each frame.
+        int fi[7];
+        for (int e = 0; e < 7; e++)
+            fi[e] = (bufIdx - 1 - e * ghostSpacing + BUFFER_SIZE * 10) % BUFFER_SIZE;
+
+        static const float w[7] = {7/28.f, 6/28.f, 5/28.f, 4/28.f, 3/28.f, 2/28.f, 1/28.f};
+
+        float eB[7], eG[7], eR[7];
+        for (int e = 0; e < 7; e++)
+        {
+            float hue = fmod(rainbowHue - e * RAINBOW_HUE_STEP + 360.0f * 7, 360.0f);
+            float h6 = hue / 60.0f;
+            int hi = (int)h6 % 6;
+            float f = h6 - (int)h6, q = 1.0f - f;
+            switch (hi)
+            {
+            case 0: eR[e]=1; eG[e]=f; eB[e]=0; break;
+            case 1: eR[e]=q; eG[e]=1; eB[e]=0; break;
+            case 2: eR[e]=0; eG[e]=1; eB[e]=f; break;
+            case 3: eR[e]=0; eG[e]=q; eB[e]=1; break;
+            case 4: eR[e]=f; eG[e]=0; eB[e]=1; break;
+            default: eR[e]=1; eG[e]=0; eB[e]=q; break;
+            }
+        }
+
+#pragma omp parallel for schedule(static)
+        for (int y = 0; y < height; y++)
+        {
+            const float *motRow = motionMap.ptr<float>(y);
+            Vec3b *outRow = output.ptr<Vec3b>(y);
+            for (int x = 0; x < width; x++)
+            {
+                float m = motRow[x];
+                if (m < 0.05f) { outRow[x] = Vec3b(0, 0, 0); continue; }
+                float B = 0, G = 0, R = 0;
+                for (int e = 0; e < 7; e++)
+                {
+                    const Vec3b &p = frameBuffer[fi[e]].ptr<Vec3b>(y)[x];
+                    float lum = (0.114f * p[0] + 0.587f * p[1] + 0.299f * p[2]) * (1.0f/255.0f);
+                    B += eB[e] * lum * w[e];
+                    G += eG[e] * lum * w[e];
+                    R += eR[e] * lum * w[e];
+                }
+                float boost = min(m * 3.0f, 1.0f) * 2.0f * 255.0f;
+                outRow[x] = Vec3b(
+                    (uchar)min(255.f, B * boost),
+                    (uchar)min(255.f, G * boost),
+                    (uchar)min(255.f, R * boost));
+            }
+        }
+    }
+    else if (currentMode == "prismaticghost")
+    {
+        // Person masks from Vision segmentation, each echo tinted a spectral hue (like T but
+        // on masked silhouettes). Echoes blended additively so overlaps become brighter;
+        // glow applied via sqrtf(alpha) falloff so mask edges bloom.
+        int base = segReady.load(memory_order_acquire);
+        if (base < 0) { output.setTo(Scalar(0, 0, 0)); return; }
+
+        int fi[TGHOST_ECHOES];
+        for (int e = 0; e < TGHOST_ECHOES; e++)
+            fi[e] = (base - e * tghostSpacing + BUFFER_SIZE * 10) % BUFFER_SIZE;
+
+        // Precompute per-echo hue→BGR (cycling like rainbow ghost)
+        float eB[TGHOST_ECHOES], eG[TGHOST_ECHOES], eR[TGHOST_ECHOES];
+        for (int e = 0; e < TGHOST_ECHOES; e++)
+        {
+            float hue = fmod(rainbowHue - e * RAINBOW_HUE_STEP + 360.0f * TGHOST_ECHOES, 360.0f);
+            float h6 = hue / 60.0f;
+            int hi = (int)h6 % 6;
+            float f = h6 - (int)h6, q = 1.0f - f;
+            switch (hi)
+            {
+            case 0: eR[e]=1; eG[e]=f; eB[e]=0; break;
+            case 1: eR[e]=q; eG[e]=1; eB[e]=0; break;
+            case 2: eR[e]=0; eG[e]=1; eB[e]=f; break;
+            case 3: eR[e]=0; eG[e]=q; eB[e]=1; break;
+            case 4: eR[e]=f; eG[e]=0; eB[e]=1; break;
+            default: eR[e]=1; eG[e]=0; eB[e]=q; break;
+            }
+        }
+
+        float gb      = glowBoost;
+        float cx      = (width  - 1) * 0.5f;
+        float cy      = (height - 1) * 0.5f;
+        float maxDist = sqrtf(cx * cx + cy * cy); // corner distance for brightness ramp
+        float ro      = ringOffset;
+#pragma omp parallel for schedule(static)
+        for (int y = 0; y < height; y++)
+        {
+            Vec3b *outRow = output.ptr<Vec3b>(y);
+            const uchar *maskRows[TGHOST_ECHOES];
+            const Vec3b *frameRows[TGHOST_ECHOES];
+            for (int e = 0; e < TGHOST_ECHOES; e++)
+            {
+                maskRows[e]  = maskBuffer[fi[e]].ptr<uchar>(y);
+                frameRows[e] = frameBuffer[fi[e]].ptr<Vec3b>(y);
+            }
+            float dy2 = (y - cy) * (y - cy);
+            for (int x = 0; x < width; x++)
+            {
+                // Ring backdrop: light sections are black at centre, brighten toward edges
+                float dist  = sqrtf(dy2 + (x - cx) * (x - cx));
+                float phase = fmodf(dist - ro + RING_SPACING * 1000.0f, RING_SPACING);
+                float rv    = (phase < RING_SPACING * 0.5f) ? (dist / maxDist) * 35.0f : 0.0f;
+                float B = rv, G = rv, R = rv;
+
+                // Additive echo accumulation
+                for (int e = 0; e < TGHOST_ECHOES; e++)
+                {
+                    float alpha = maskRows[e][x] * (1.0f / 255.0f);
+                    if (alpha < 0.05f) continue;
+                    const Vec3b &p = frameRows[e][x];
+                    float lum = (0.114f * p[0] + 0.587f * p[1] + 0.299f * p[2]) * (1.0f / 255.0f);
+                    // sqrtf(alpha) blooms soft mask edges; multiply by lum and boost
+                    float glow = sqrtf(alpha) * lum * gb;
+                    B += eB[e] * glow * 255.0f;
+                    G += eG[e] * glow * 255.0f;
+                    R += eR[e] * glow * 255.0f;
+                }
+                outRow[x] = Vec3b(
+                    (uchar)(B > 255.0f ? 255 : (int)B),
+                    (uchar)(G > 255.0f ? 255 : (int)G),
+                    (uchar)(R > 255.0f ? 255 : (int)R));
+            }
+        }
+    }
     else if (currentMode == "timeghost")
     {
         // Composite TGHOST_ECHOES silhouettes of the person from different moments in time.
@@ -818,6 +952,76 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
                         (uchar)min(255.0f, eB[e] * brightness),
                         (uchar)min(255.0f, eG[e] * brightness),
                         (uchar)min(255.0f, eR[e] * brightness));
+                }
+            }
+        }
+    }
+    else if (currentMode == "tunneltimeghost")
+    {
+        // Temporal Ghost variant: each older echo is scaled up toward centre (same tunnel
+        // geometry as Tunnel Ghost) but uses natural colour + brightness fade like Temporal Ghost.
+        int base = segReady.load(memory_order_acquire);
+        if (base < 0) { output.setTo(Scalar(0, 0, 0)); return; }
+
+        int fi[TGHOST_ECHOES];
+        for (int e = 0; e < TGHOST_ECHOES; e++)
+            fi[e] = (base - e * tghostSpacing + BUFFER_SIZE * 10) % BUFFER_SIZE;
+
+        float echoFade[TGHOST_ECHOES];
+        for (int e = 0; e < TGHOST_ECHOES; e++)
+            echoFade[e] = 0.30f + 0.70f * (1.0f - (float)e / (TGHOST_ECHOES - 1));
+
+        float inv_s[TGHOST_ECHOES];
+        for (int e = 0; e < TGHOST_ECHOES; e++)
+        {
+            float s = 1.0f + (tunnelScale - 1.0f) * (float)e / (TGHOST_ECHOES - 1);
+            inv_s[e] = 1.0f / s;
+        }
+
+        float cx = (width  - 1) * 0.5f;
+        float cy = (height - 1) * 0.5f;
+        float ro = ringOffset;
+#pragma omp parallel for schedule(static)
+        for (int y = 0; y < height; y++)
+        {
+            Vec3b *outRow = output.ptr<Vec3b>(y);
+
+            const uchar *maskRowE[TGHOST_ECHOES]  = {};
+            const Vec3b *frameRowE[TGHOST_ECHOES] = {};
+            float ixBias[TGHOST_ECHOES];
+            float dy2 = (y - cy) * (y - cy);
+            for (int e = 0; e < TGHOST_ECHOES; e++)
+            {
+                float sy = cy + (y - cy) * inv_s[e];
+                int iy = (int)(sy + 0.5f);
+                if ((unsigned)iy < (unsigned)height)
+                {
+                    maskRowE[e]  = maskBuffer[fi[e]].ptr<uchar>(iy);
+                    frameRowE[e] = frameBuffer[fi[e]].ptr<Vec3b>(iy);
+                }
+                ixBias[e] = cx * (1.0f - inv_s[e]);
+            }
+
+            for (int x = 0; x < width; x++)
+            {
+                float dist  = sqrtf(dy2 + (x - cx) * (x - cx));
+                float phase = fmodf(dist - ro + RING_SPACING * 1000.0f, RING_SPACING);
+                uchar rv    = (phase < RING_SPACING * 0.5f) ? 35 : 0;
+                outRow[x]   = Vec3b(rv, rv, rv);
+
+                for (int e = TGHOST_ECHOES - 1; e >= 0; e--)
+                {
+                    if (!maskRowE[e]) continue;
+                    int ix = (int)(ixBias[e] + x * inv_s[e] + 0.5f);
+                    if ((unsigned)ix >= (unsigned)width) continue;
+                    int alpha = maskRowE[e][ix];
+                    if (alpha < 13) continue;
+                    float total = (alpha / 255.0f) * echoFade[e];
+                    const Vec3b &p = frameRowE[e][ix];
+                    outRow[x] = Vec3b(
+                        (uchar)(p[0] * total),
+                        (uchar)(p[1] * total),
+                        (uchar)(p[2] * total));
                 }
             }
         }
@@ -1037,9 +1241,9 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
                 float dr = abs((int)currRow[x][2] - (int)prevRow[x][2]) * (1.0f/255.0f);
                 float dg = abs((int)currRow[x][1] - (int)prevRow[x][1]) * (1.0f/255.0f);
                 float db = abs((int)currRow[x][0] - (int)prevRow[x][0]) * (1.0f/255.0f);
-                rB[x] = ((rAp[x]+rAn[x]+rA[x-1]+rA[x+1])*0.5f - rB[x]) * WAVE_DAMP + dr * WAVE_SEED;
-                gB[x] = ((gAp[x]+gAn[x]+gA[x-1]+gA[x+1])*0.5f - gB[x]) * WAVE_DAMP + dg * WAVE_SEED;
-                bB[x] = ((bAp[x]+bAn[x]+bA[x-1]+bA[x+1])*0.5f - bB[x]) * WAVE_DAMP + db * WAVE_SEED;
+                rB[x] = ((rAp[x]+rAn[x]+rA[x-1]+rA[x+1])*0.5f - rB[x]) * CWAVE_DAMP + dr * CWAVE_SEED;
+                gB[x] = ((gAp[x]+gAn[x]+gA[x-1]+gA[x+1])*0.5f - gB[x]) * CWAVE_DAMP + dg * CWAVE_SEED;
+                bB[x] = ((bAp[x]+bAn[x]+bA[x-1]+bA[x+1])*0.5f - bB[x]) * CWAVE_DAMP + db * CWAVE_SEED;
             }
         }
         std::swap(waveAr, waveBr);
@@ -1058,12 +1262,19 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
             {
                 auto clampW = [&](int v, int mx){ return v < 0 ? 0 : v >= mx ? mx-1 : v; };
 
-                int sxR = clampW((int)(x + (rC[x+1]-rC[x-1]) * refract + 0.5f), width);
-                int syR = clampW((int)(y + (rN[x]  -rP[x]  ) * refract + 0.5f), height);
-                int sxG = clampW((int)(x + (gC[x+1]-gC[x-1]) * refract + 0.5f), width);
-                int syG = clampW((int)(y + (gN[x]  -gP[x]  ) * refract + 0.5f), height);
-                int sxB = clampW((int)(x + (bC[x+1]-bC[x-1]) * refract + 0.5f), width);
-                int syB = clampW((int)(y + (bN[x]  -bP[x]  ) * refract + 0.5f), height);
+                // Each channel's gradient is rotated 120° apart so they displace in
+                // different spatial directions, guaranteeing vivid colour separation.
+                // R: 0°, G: 120°, B: 240°  (√3/2 ≈ 0.866)
+                float rdx = rC[x+1]-rC[x-1],  rdy = rN[x]-rP[x];
+                float gdx = gC[x+1]-gC[x-1],  gdy = gN[x]-gP[x];
+                float bdx = bC[x+1]-bC[x-1],  bdy = bN[x]-bP[x];
+
+                int sxR = clampW((int)(x + rdx * refract + 0.5f), width);
+                int syR = clampW((int)(y + rdy * refract + 0.5f), height);
+                int sxG = clampW((int)(x + (-0.5f*gdx - 0.866f*gdy) * refract + 0.5f), width);
+                int syG = clampW((int)(y + ( 0.866f*gdx - 0.5f*gdy) * refract + 0.5f), height);
+                int sxB = clampW((int)(x + (-0.5f*bdx + 0.866f*bdy) * refract + 0.5f), width);
+                int syB = clampW((int)(y + (-0.866f*bdx - 0.5f*bdy) * refract + 0.5f), height);
 
                 uchar R = frameBuffer[recent].ptr<Vec3b>(syR)[sxR][2];
                 uchar G = frameBuffer[recent].ptr<Vec3b>(syG)[sxG][1];
@@ -1242,14 +1453,20 @@ string getModeName()
         return "U: Datamosh";
     if (currentMode == "ghostecho")
         return "C: Ghost Echo";
+    if (currentMode == "chromaghostecho")
+        return "C: Chroma Ghost Echo";
     if (currentMode == "timeghost")
         return "H: Temporal Ghost";
+    if (currentMode == "tunneltimeghost")
+        return "H: Tunnel Time Ghost";
     if (currentMode == "rainbowghost")
         return "G: Rainbow Ghost";
     if (currentMode == "turbulence")
         return "I: Turbulence";
     if (currentMode == "tunnelghost")
         return "B: Tunnel Ghost";
+    if (currentMode == "prismaticghost")
+        return "B: Prismatic Ghost";
     if (currentMode == "flowwarp")
         return "V: Flow Warp";
     if (currentMode == "wavewarp")
@@ -1496,11 +1713,13 @@ int main()
         }
 
         // Advance rainbow hue — used by rainbowghost and tunnelghost modes.
-        if (currentMode == "rainbowghost" || currentMode == "tunnelghost")
+        if (currentMode == "rainbowghost" || currentMode == "tunnelghost" ||
+            currentMode == "chromaghostecho" || currentMode == "prismaticghost")
             rainbowHue = fmod(rainbowHue + rainbowSpeed / 60.0f, 360.0f);
         // Advance ring backdrop phase — used by ghost modes and ring warp.
         if (currentMode == "rainbowghost" || currentMode == "timeghost" ||
-            currentMode == "tunnelghost" || currentMode == "flowwarp")
+            currentMode == "tunnelghost" || currentMode == "tunneltimeghost" ||
+            currentMode == "prismaticghost" || currentMode == "flowwarp")
             ringOffset = fmodf(ringOffset + RING_SPEED / 60.0f, RING_SPACING);
 
         // Update flow ripple buffer — advect, decay, inject — used by flowripple mode.
@@ -1666,18 +1885,21 @@ int main()
         }
         else if (key == 't')
         {
-            currentMode = "prismatic";
-            cout << "Mode: " << getModeName() << endl;
-        }
-        else if (key == 'k')
-        {
-            currentMode = "flowhue";
+            if (currentMode == "prismatic")
+                currentMode = "prismaticghost";
+            else
+                currentMode = "prismatic";
             cout << "Mode: " << getModeName() << endl;
         }
         else if (key == 'y')
         {
-            currentMode = "flowripple";
-            rippleBuffer.setTo(0); // clear lingering state on entry
+            if (currentMode == "flowripple")
+                currentMode = "flowhue";
+            else
+            {
+                currentMode = "flowripple";
+                rippleBuffer.setTo(0); // clear lingering state on entry
+            }
             cout << "Mode: " << getModeName() << endl;
         }
         else if (key == 'i')
@@ -1695,22 +1917,26 @@ int main()
         }
         else if (key == 'c')
         {
-            currentMode = "ghostecho";
+            if (currentMode == "ghostecho")
+                currentMode = "chromaghostecho";
+            else
+                currentMode = "ghostecho";
             cout << "Mode: " << getModeName() << endl;
         }
         else if (key == 'h')
         {
-            currentMode = "timeghost";
+            if (currentMode == "timeghost")
+                currentMode = "tunneltimeghost";
+            else
+                currentMode = "timeghost";
             cout << "Mode: " << getModeName() << endl;
         }
         else if (key == 'g')
         {
-            currentMode = "rainbowghost";
-            cout << "Mode: " << getModeName() << endl;
-        }
-        else if (key == 'b')
-        {
-            currentMode = "tunnelghost";
+            if (currentMode == "rainbowghost")
+                currentMode = "tunnelghost";
+            else
+                currentMode = "rainbowghost";
             cout << "Mode: " << getModeName() << endl;
         }
         else if (key == 'v')
@@ -1718,18 +1944,20 @@ int main()
             currentMode = "flowwarp";
             cout << "Mode: " << getModeName() << endl;
         }
-        else if (key == 'n')
+        else if (key == 'k')
         {
-            currentMode = "wavewarp";
-            waveA.setTo(0); waveB.setTo(0);
-            cout << "Mode: " << getModeName() << endl;
-        }
-        else if (key == 'm')
-        {
-            currentMode = "chromawave";
-            waveAr.setTo(0); waveBr.setTo(0);
-            waveAg.setTo(0); waveBg.setTo(0);
-            waveAb.setTo(0); waveBb.setTo(0);
+            if (currentMode == "wavewarp")
+            {
+                currentMode = "chromawave";
+                waveAr.setTo(0); waveBr.setTo(0);
+                waveAg.setTo(0); waveBg.setTo(0);
+                waveAb.setTo(0); waveBb.setTo(0);
+            }
+            else
+            {
+                currentMode = "wavewarp";
+                waveA.setTo(0); waveB.setTo(0);
+            }
             cout << "Mode: " << getModeName() << endl;
         }
         else if (key == 'f')
@@ -1781,7 +2009,7 @@ int main()
                 turbShift = 20.0f;
                 overlayText = "Shift: " + to_string((int)turbShift);
             }
-            else if (currentMode == "ghostecho")
+            else if (currentMode == "ghostecho" || currentMode == "chromaghostecho")
             {
                 ghostSpacing = 8;
                 overlayText = "Spacing: " + to_string(ghostSpacing);
@@ -1796,10 +2024,15 @@ int main()
                 tghostSpacing = 20;
                 overlayText = "Spacing: " + to_string(tghostSpacing);
             }
-            else if (currentMode == "tunnelghost")
+            else if (currentMode == "tunnelghost" || currentMode == "tunneltimeghost")
             {
                 tunnelScale = 3.0f;
                 overlayText = "Zoom: " + to_string(tunnelScale).substr(0, 3) + "x";
+            }
+            else if (currentMode == "prismaticghost")
+            {
+                glowBoost = 0.5f;
+                overlayText = "Glow: " + to_string(glowBoost).substr(0, 3);
             }
             else if (currentMode == "flowwarp")
             {
@@ -1813,7 +2046,7 @@ int main()
             }
             else if (currentMode == "chromawave")
             {
-                chromaWaveRefract = 15.0f;
+                chromaWaveRefract = 30.0f;
                 overlayText = "Refract: " + to_string((int)chromaWaveRefract);
             }
             else
@@ -1867,7 +2100,7 @@ int main()
                 turbShift = min(60.0f, turbShift + 2.0f);
                 overlayText = "Shift: " + to_string((int)turbShift);
             }
-            else if (currentMode == "ghostecho")
+            else if (currentMode == "ghostecho" || currentMode == "chromaghostecho")
             {
                 ghostSpacing = min(BUFFER_SIZE / 7, ghostSpacing + 1);
                 overlayText = "Spacing: " + to_string(ghostSpacing);
@@ -1882,10 +2115,15 @@ int main()
                 tghostSpacing = min(BUFFER_SIZE / TGHOST_ECHOES, tghostSpacing + 1);
                 overlayText = "Spacing: " + to_string(tghostSpacing);
             }
-            else if (currentMode == "tunnelghost")
+            else if (currentMode == "tunnelghost" || currentMode == "tunneltimeghost")
             {
                 tunnelScale = min(8.0f, tunnelScale + 0.5f);
                 overlayText = "Zoom: " + to_string(tunnelScale).substr(0, 3) + "x";
+            }
+            else if (currentMode == "prismaticghost")
+            {
+                glowBoost = min(6.0f, glowBoost + 0.25f);
+                overlayText = "Glow: " + to_string(glowBoost).substr(0, 3);
             }
             else if (currentMode == "flowwarp")
             {
@@ -1953,7 +2191,7 @@ int main()
                 turbShift = max(2.0f, turbShift - 2.0f);
                 overlayText = "Shift: " + to_string((int)turbShift);
             }
-            else if (currentMode == "ghostecho")
+            else if (currentMode == "ghostecho" || currentMode == "chromaghostecho")
             {
                 ghostSpacing = max(1, ghostSpacing - 1);
                 overlayText = "Spacing: " + to_string(ghostSpacing);
@@ -1968,10 +2206,15 @@ int main()
                 tghostSpacing = max(1, tghostSpacing - 1);
                 overlayText = "Spacing: " + to_string(tghostSpacing);
             }
-            else if (currentMode == "tunnelghost")
+            else if (currentMode == "tunnelghost" || currentMode == "tunneltimeghost")
             {
                 tunnelScale = max(1.2f, tunnelScale - 0.5f);
                 overlayText = "Zoom: " + to_string(tunnelScale).substr(0, 3) + "x";
+            }
+            else if (currentMode == "prismaticghost")
+            {
+                glowBoost = max(0.25f, glowBoost - 0.25f);
+                overlayText = "Glow: " + to_string(glowBoost).substr(0, 3);
             }
             else if (currentMode == "flowwarp")
             {

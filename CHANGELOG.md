@@ -2,6 +2,26 @@
 
 ---
 
+## 2026-05-12 — Toggle-pair mode system; Prismatic Ghost; Chroma Ghost Echo; Tunnel Time Ghost; Chroma Wave tuning
+
+### Added
+- **Prismatic Ghost (T alt)** — Vision person-mask echoes tinted with cycling spectral hues, blended additively. Glow applied via `sqrtf(alpha)` so mask edges bloom. Ring backdrop uses a radial brightness ramp: black at frame centre, up to 35/255 at corners. Up/Down adjusts `glowBoost` (default 0.5). Toggled by pressing T while already in Prismatic Echo.
+- **Tunnel Time Ghost (H alt)** — Temporal Ghost with tunnel zoom geometry (older echoes scaled up toward centre). Shares `tunnelScale` with Tunnel Ghost. Toggled by pressing H while in Temporal Ghost.
+- **Chroma Ghost Echo (C alt)** — Ghost Echo with per-echo cycling hue tints (additive blend, same motion mask). Toggled by pressing C while in Ghost Echo.
+
+### Changed
+- **Toggle-pair system** — all major keys now cycle between two related modes on repeated press:
+  - **T**: Prismatic Echo ↔ Prismatic Ghost
+  - **Y**: Flow Color Ripple ↔ Flow Direction Color (K absorbed)
+  - **G**: Rainbow Ghost ↔ Tunnel Ghost
+  - **H**: Temporal Ghost ↔ Tunnel Time Ghost
+  - **C**: Ghost Echo ↔ Chroma Ghost Echo
+  - **K**: Wave Warp ↔ Chroma Wave (N and M keys absorbed)
+- **Chroma Wave (K alt) bigger waves** — separate `CWAVE_SEED=8.0` (was shared 3.0) and `CWAVE_DAMP=0.985` (was 0.97) give larger sustained amplitudes. Default `chromaWaveRefract` raised 15→30.
+- **Chroma Wave 120° displacement rotation** — R, G, B channel displacements rotated 120° apart so even similar wave patterns create vivid per-channel colour separation in different spatial directions.
+
+---
+
 ## 2026-05-12 — Add Flow Warp (V), Wave Warp (N), Chroma Wave (M); expand ring backdrop; fix Tunnel Ghost scaling
 
 ### Added

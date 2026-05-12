@@ -64,25 +64,24 @@ Produces `TimeMirror_notarized.zip` — trusted by Gatekeeper on any Mac.
 
 ### Special Effect Modes
 
-| Key | Mode | Description |
-|-----|------|-------------|
-| **T** | Prismatic Echo | 6 spectral echoes (red→magenta) spaced through the buffer; motion creates rainbow trails |
-| **Y** | Flow Color Ripple | Directional color that advects with optical flow and decays over time |
-| **U** | Datamosh | IIR motion diff accumulation — moving subjects leave bright color trails |
-| **I** | Turbulence | Motion history drives displacement + chroma + saturation |
-| **G** | Rainbow Ghost | Like H but each echo tinted a cycling hue; color flows newest→oldest |
-| **H** | Temporal Ghost | 7 person silhouettes at different moments in time, on black |
-| **J** | Motion Chromatic | Still areas = no color shift; moving areas = vivid RGB temporal split |
-| **K** | Flow Direction Color | Optical flow direction → hue, magnitude → saturation |
-| **Z** | Motion Adaptive | Displacement intensity scales with per-pixel motion |
-| **X** | Chromatic Time Shift | R/G/B channels pulled from slightly different frame offsets |
-| **C** | Ghost Echo | 7 motion-masked temporal echoes composited on black |
-| **V** | Flow Warp | Optical flow displaces the live camera feed — motion warps the image |
-| **N** | Wave Warp | 2D wave simulation seeded by motion; gradients refract the camera |
-| **M** | Chroma Wave | Three independent waves (one per RGB channel) create per-channel chromatic refraction |
-| **B** | Tunnel Ghost | Rainbow ghost with echoes zoomed in — oldest echo largest, creating an expanding tunnel |
+Many keys toggle between two related modes — press again to switch.
 
-> **G, H, and B modes** use Apple's Vision framework (built into macOS 12+) — no Python or MediaPipe required.
+| Key | Mode | Alt (press again) | Description |
+|-----|------|-------------------|-------------|
+| **T** | Prismatic Echo | Prismatic Ghost | T: spectral echoes through the buffer; T again: same spectral colors on Vision person masks, additive glow |
+| **Y** | Flow Color Ripple | Flow Direction Color | Y: color advects with optical flow; Y again: flow direction → hue, magnitude → saturation |
+| **U** | Datamosh | — | IIR motion diff accumulation — moving subjects leave bright color trails |
+| **I** | Turbulence | — | Motion history drives displacement + chroma + saturation |
+| **G** | Rainbow Ghost | Tunnel Ghost | G: cycling-hue person echoes; G again: same but echoes zoom in oldest→largest |
+| **H** | Temporal Ghost | Tunnel Time Ghost | H: natural-color person echoes; H again: same but echoes zoom in oldest→largest |
+| **J** | Motion Chromatic | — | Still areas = no color shift; moving areas = vivid RGB temporal split |
+| **K** | Wave Warp | Chroma Wave | K: 2D wave refracts full frame; K again: three independent per-channel waves |
+| **Z** | Motion Adaptive | — | Displacement intensity scales with per-pixel motion |
+| **X** | Chromatic Time Shift | — | R/G/B channels pulled from slightly different frame offsets |
+| **C** | Ghost Echo | Chroma Ghost Echo | C: motion-masked echoes on black; C again: same with cycling rainbow hue tints |
+| **V** | Flow Warp | — | Optical flow displaces the live camera feed — motion warps the image |
+
+> **G, H, and T (Prismatic Ghost alt)** use Apple's Vision framework (built into macOS 12+) — no Python or MediaPipe required.
 
 ### Other Controls
 
