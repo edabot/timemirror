@@ -147,9 +147,81 @@ Background = black
 - Default `tghostSpacing = 20` frames (shared with H mode)
 - Up/Down adjusts `tghostSpacing` (range: 1 – `BUFFER_SIZE / TGHOST_ECHOES`)
 
+### B — Tunnel Ghost
+```
+s[e]      = 1.0 + (tunnelScale − 1.0) × e / (TGHOST_ECHOES − 1)
+inv_s[e]  = 1 / s[e]
+src_x = cx + (x − cx) × inv_s[e]      (per-pixel, per-echo)
+src_y = cy + (y − cy) × inv_s[e]      (per-row, per-echo — hoisted)
+```
+- Newest echo (e=0): s=1.0, full-frame (inv_s=1.0, no zoom)
+- Oldest echo (e=6): s=tunnelScale, zoomed in (inv_s<1.0, samples a centre crop — person appears larger than frame)
+- Rendered back-to-front so nearest (fullest) echo paints last
+- Same rainbow hue palette as G mode; `rainbowHue` advances at `rainbowSpeed`
+- Default `tunnelScale = 3.0` (oldest echo 3× zoomed)
+- Up/Down adjusts `tunnelScale` (range: 1.2 – 8.0, step 0.5)
+- `tghostSpacing` shared with G/H modes for echo frame spacing
+
+### Expanding ring backdrop (H, G, B modes)
+```
+dist  = sqrt((x − cx)² + (y − cy)²)
+phase = fmod(dist − ringOffset, RING_SPACING)
+pixel = 35 if phase < RING_SPACING/2 else 0   (dark gray / black alternation)
+ringOffset advances RING_SPEED/60 px per frame
+```
+- `RING_SPEED = 75` px/s; `RING_SPACING = 200` px between ring centres
+- Background drawn first; person echoes composited on top
+- `dy²` hoisted per row; only `sqrtf` computed per pixel
+
 ---
 
-## Segmentation subsystem (H, G modes)
+### V — Flow Warp
+```
+(vx, vy) = Farneback optical flow at FLOW_SCALE (0.25×), scaled to full-res units
+sx = x + vx × flowWarpScale
+sy = y + vy × flowWarpScale
+output[y][x] = frameBuffer[recent][sy][sx]
+```
+- Default `flowWarpScale = 10.0`
+- Flow computed by preprocessLoop and double-buffered into `flowMapBuf`
+- Fast motion → large displacement; still areas → identity (no warp)
+- Up/Down adjusts `flowWarpScale` (range: 1 – 50)
+
+### N — Wave Warp
+```
+Wave propagation (explicit Euler, per frame):
+  new[y][x] = (N+S+E+W) × 0.5 − prev[y][x]   (wave equation)
+  new[y][x] × WAVE_DAMP + motionMap[y][x] × WAVE_SEED
+Displacement:
+  dx = waveA[y][x+1] − waveA[y][x−1]
+  dy = waveA[y+1][x] − waveA[y−1][x]
+  output[y][x] = frameBuffer[recent][y + dy×refract][x + dx×refract]
+```
+- `WAVE_DAMP = 0.97`; `WAVE_SEED = 3.0`
+- Default `waveRefract = 15.0`; Up/Down adjusts (range: 1 – 50)
+- Motion map seeded from preprocessLoop; full frame (including person) is distorted
+- Double-buffered `waveA`/`waveB` swapped each frame (`std::swap`, O(1))
+
+### M — Chroma Wave
+```
+Three independent wave simulations — one per RGB channel.
+Each seeded from its own channel's absdiff (not grayscale motion map):
+  drR = |curr[y][x].R − prev[y][x].R| / 255
+  drG = |curr[y][x].G − prev[y][x].G| / 255
+  drB = |curr[y][x].B − prev[y][x].B| / 255
+Per-channel displacement:
+  output[y][x].R = frameBuffer[recent][syR][sxR].R
+  output[y][x].G = frameBuffer[recent][syG][sxG].G
+  output[y][x].B = frameBuffer[recent][syB][sxB].B
+```
+- Default `chromaWaveRefract = 15.0`; Up/Down adjusts (range: 1 – 50)
+- R/G/B motion drives independent wave patterns; different-coloured motion creates distinct per-channel refraction
+- Full frame (including person) distorted — no mask compositing
+- Three wave propagations fused into one OMP pass
+
+---
+
+## Segmentation subsystem (H, G, B modes)
 
 Person segmentation uses `VNGeneratePersonSegmentationRequest` from Apple's Vision framework (macOS 12+). No Python, MediaPipe, or external model files required.
 

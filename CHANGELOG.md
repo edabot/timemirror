@@ -2,6 +2,32 @@
 
 ---
 
+## 2026-05-12 — Add Flow Warp (V), Wave Warp (N), Chroma Wave (M); expand ring backdrop; fix Tunnel Ghost scaling
+
+### Added
+- **V: Flow Warp** — Farneback optical flow displaces the live camera sample per pixel. Fast motion warps and smears the image; still areas are unaffected. Up/Down adjusts `flowWarpScale` (default 10, range 1–50).
+- **N: Wave Warp** — Classic 2D wave equation (explicit Euler, damped) seeded by the motion map. Wave gradients refract the camera sample per pixel. Full frame distorted — no person mask compositing. Up/Down adjusts `waveRefract` (default 15, range 1–50).
+- **M: Chroma Wave** — Three independent wave simulations seeded from each RGB channel's own absdiff, so R, G, B motion drives separate wave patterns. Each channel's gradient displaces only that channel's camera sample, producing per-channel chromatic refraction. Full frame distorted. Up/Down adjusts `chromaWaveRefract` (default 15, range 1–50).
+- **Expanding ring backdrop (H, G, B)** — Concentric gray/black rings radiate outward from the frame centre behind all ghost-mode echoes. `RING_SPEED = 75` px/s, `RING_SPACING = 200` px. Pure math — no object list; `dy²` hoisted per row.
+
+### Changed
+- **B: Tunnel Ghost scaling corrected** — Formula rewritten so newest echo = full frame (s=1.0) and oldest echo = `tunnelScale`× zoom (s>1, samples a centre crop so the person appears larger than the frame). Default `tunnelScale` changed from 0.15 to 3.0; Up/Down range is now 1.2–8.0 (step 0.5).
+
+### Fixed
+- **N and M full-frame distortion** — Both modes previously composited the person mask back over the wave-distorted output, leaving the subject un-distorted. Removed the compositing; ripple/refraction now covers the full frame including the person.
+
+---
+
+## 2026-05-06 — Reassign mode keys; add Tunnel Ghost (B)
+
+### Changed
+- **Mode key reassignment** — final 8 effect modes moved to TYUIGHJK row; test/experimental modes moved to ZXCV row. New layout: T=Prismatic, Y=Flow Ripple, U=Datamosh, I=Turbulence, G=Rainbow Ghost, H=Temporal Ghost, J=Motion Chromatic, K=Flow Direction Color; Z=Motion Adaptive, X=Chromatic Time Shift, C=Ghost Echo, V=Background Removal.
+
+### Added
+- **B: Tunnel Ghost** — Rainbow Ghost variant where each older echo is scaled down toward the image centre, creating a receding tunnel of coloured person silhouettes. Newest echo = full frame; oldest echo = `tunnelScale` × full frame (default 15%). Up/Down adjusts `tunnelScale` (5%–90%). Uses Vision framework person segmentation; shares `tghostSpacing` and `rainbowHue` with G mode.
+
+---
+
 ## 2026-04-27 — Preprocessing thread, performance tuning, datamosh tuning
 
 ### Added

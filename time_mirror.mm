@@ -64,9 +64,25 @@ int chromaSpread = 40; // Max frames between channels at full motion (0-motion =
 // Still areas → black. Moving subjects → layered ghost images from past frames.
 int ghostSpacing = 8; // Frames between each of 7 echoes (Up/Down adjustable)
 
-// Background Removal mode (V) — MOG2 Gaussian mixture background subtractor.
-// Learns background automatically; only updates background model for background pixels,
-// so a stationary subject does not bleed into the background estimate over time.
+// Flow Warp mode (V) — optical flow displaces backdrop lookup coordinates.
+// Live camera feed is sampled at (x + vx*scale, y + vy*scale) per pixel, smearing the
+// background in the direction of motion. Person cutout composited on top unwarped.
+float flowWarpScale = 10.0f; // flow amplification (Up/Down adjustable)
+
+// Wave Warp mode (N) — 2D wave simulation seeded by motion.
+// Standard wave equation: new = (neighbors sum)*0.5 - prev, with IIR damping.
+// Wave gradient displaces camera sample coordinates for a refracting water surface.
+Mat waveA, waveB;              // CV_32F double-buffer: waveA=current, waveB=previous
+float waveRefract = 15.0f;     // gradient amplification for refraction (Up/Down adjustable)
+const float WAVE_DAMP = 0.97f; // per-frame damping (lower = shorter ripples)
+const float WAVE_SEED = 3.0f;  // motion map intensity seeded into wave per frame
+
+// Chroma Wave mode (M) — three independent wave simulations, one per RGB channel.
+// Each wave is seeded from its own colour channel's absdiff so R/G/B motion drives
+// independent wave patterns; each channel's gradient displaces only that channel's sample.
+Mat waveAr, waveBr, waveAg, waveBg, waveAb, waveBb; // per-channel double buffers
+float chromaWaveRefract = 15.0f; // gradient amplification per channel (Up/Down adjustable)
+
 
 // Shared between capture thread and main thread.
 // writeIndex uses release/acquire semantics so the main thread always
@@ -140,9 +156,13 @@ vector<Mat> maskBuffer;   // CV_8U, same slots as frameBuffer
 atomic<int> segReady{-1}; // index of last written mask; -1 = not started
 int tghostSpacing = 20;   // frames between each of TGHOST_ECHOES echoes
 const int TGHOST_ECHOES = 7;
-float rainbowHue = 0.0f;         // K mode: current base hue (0–360, cycles each frame)
-float rainbowSpeed = 30.0f;      // K mode: degrees per second the hue advances
+float rainbowHue = 0.0f;         // G/B mode: current base hue (0–360, cycles each frame)
+float rainbowSpeed = 30.0f;      // G/B mode: degrees per second the hue advances
 const int RAINBOW_HUE_STEP = 45; // degrees between consecutive echoes
+float tunnelScale = 3.0f;        // B mode: scale of oldest echo (1.0=flat, higher=deeper tunnel)
+float ringOffset = 0.0f;         // G mode: expanding ring backdrop phase (px, advances each frame)
+const float RING_SPACING = 200.0f; // px between ring centres (period of gray/black alternation)
+const float RING_SPEED   = 75.0f;  // px/s ring expansion speed
 
 // Main-thread-only state
 string currentMode = "s";
@@ -329,7 +349,7 @@ void preprocessLoop(int actualWidth, int actualHeight)
 
         string mode = currentMode;
 
-        if (mode == "motion" || mode == "mchroma" || mode == "ghostecho")
+        if (mode == "motion" || mode == "mchroma" || mode == "ghostecho" || mode == "wavewarp")
         {
             int recent = latest;
             int older  = (latest - MOTION_LOOKBACK + BUFFER_SIZE * 2) % BUFFER_SIZE;
@@ -342,7 +362,7 @@ void preprocessLoop(int actualWidth, int actualHeight)
             prepBuf.store(writeBuf, memory_order_release);
             writeBuf = 1 - writeBuf;
         }
-        else if (mode == "flowhue" || mode == "flowripple")
+        else if (mode == "flowhue" || mode == "flowripple" || mode == "flowwarp")
         {
             int recent = latest;
             int older  = (latest - 1 + BUFFER_SIZE) % BUFFER_SIZE;
@@ -667,28 +687,35 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
         for (int e = 0; e < TGHOST_ECHOES; e++)
             echoFade[e] = 0.30f + 0.70f * (1.0f - (float)e / (TGHOST_ECHOES - 1));
 
-        output.setTo(Scalar(0, 0, 0));
-#pragma omp parallel for schedule(static)
-        for (int y = 0; y < height; y++)
         {
-            // Hoist row pointers outside x loop — eliminates 14*width redundant ptr() calls
-            const uchar *maskRows[TGHOST_ECHOES];
-            const Vec3b *frameRows[TGHOST_ECHOES];
-            for (int e = 0; e < TGHOST_ECHOES; e++) {
-                maskRows[e]  = maskBuffer[fi[e]].ptr<uchar>(y);
-                frameRows[e] = frameBuffer[fi[e]].ptr<Vec3b>(y);
-            }
-            Vec3b *outRow = output.ptr<Vec3b>(y);
-            // Paint oldest→newest so newest echo wins at overlapping pixels.
-            for (int x = 0; x < width; x++)
+            float cx2 = (width  - 1) * 0.5f;
+            float cy2 = (height - 1) * 0.5f;
+            float ro = ringOffset;
+#pragma omp parallel for schedule(static)
+            for (int y = 0; y < height; y++)
             {
-                for (int e = TGHOST_ECHOES - 1; e >= 0; e--)
+                const uchar *maskRows[TGHOST_ECHOES];
+                const Vec3b *frameRows[TGHOST_ECHOES];
+                for (int e = 0; e < TGHOST_ECHOES; e++) {
+                    maskRows[e]  = maskBuffer[fi[e]].ptr<uchar>(y);
+                    frameRows[e] = frameBuffer[fi[e]].ptr<Vec3b>(y);
+                }
+                Vec3b *outRow = output.ptr<Vec3b>(y);
+                float dy2 = (y - cy2) * (y - cy2);
+                for (int x = 0; x < width; x++)
                 {
-                    int alpha = maskRows[e][x];
-                    if (alpha < 13) continue; // 0.05 * 255
-                    float total = (alpha / 255.0f) * echoFade[e];
-                    const Vec3b &p = frameRows[e][x];
-                    outRow[x] = Vec3b((uchar)(p[0]*total), (uchar)(p[1]*total), (uchar)(p[2]*total));
+                    float dist  = sqrtf(dy2 + (x - cx2) * (x - cx2));
+                    float phase = fmodf(dist - ro + RING_SPACING * 1000.0f, RING_SPACING);
+                    uchar rv    = (phase < RING_SPACING * 0.5f) ? 35 : 0;
+                    outRow[x]   = Vec3b(rv, rv, rv);
+                    for (int e = TGHOST_ECHOES - 1; e >= 0; e--)
+                    {
+                        int alpha = maskRows[e][x];
+                        if (alpha < 13) continue;
+                        float total = (alpha / 255.0f) * echoFade[e];
+                        const Vec3b &p = frameRows[e][x];
+                        outRow[x] = Vec3b((uchar)(p[0]*total), (uchar)(p[1]*total), (uchar)(p[2]*total));
+                    }
                 }
             }
         }
@@ -754,7 +781,12 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
             }
         }
 
-        output.setTo(Scalar(0, 0, 0));
+        // Expanding ring backdrop: concentric gray/black rings that slowly grow outward.
+        // Each pixel's ring color is determined by its distance from centre modulo RING_SPACING.
+        // ringOffset advances each frame so rings appear to expand.
+        float cx = (width  - 1) * 0.5f;
+        float cy = (height - 1) * 0.5f;
+        float ro = ringOffset; // local copy — safe to read on main thread
 #pragma omp parallel for schedule(static)
         for (int y = 0; y < height; y++)
         {
@@ -765,8 +797,16 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
                 frameRows[e] = frameBuffer[fi[e]].ptr<Vec3b>(y);
             }
             Vec3b *outRow = output.ptr<Vec3b>(y);
+            float dy2 = (y - cy) * (y - cy);
             for (int x = 0; x < width; x++)
             {
+                // Ring backdrop
+                float dist  = sqrtf(dy2 + (x - cx) * (x - cx));
+                float phase = fmodf(dist - ro + RING_SPACING * 1000.0f, RING_SPACING);
+                uchar rv    = (phase < RING_SPACING * 0.5f) ? 35 : 0;
+                outRow[x]   = Vec3b(rv, rv, rv);
+
+                // Echo overlay (oldest → newest so newest paints on top)
                 for (int e = TGHOST_ECHOES - 1; e >= 0; e--)
                 {
                     int alpha = maskRows[e][x];
@@ -781,6 +821,260 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
                 }
             }
         }
+    }
+    else if (currentMode == "tunnelghost")
+    {
+        // Rainbow Ghost variant where each older echo is scaled down toward the image centre,
+        // creating a receding tunnel of coloured person silhouettes.
+        // Newest echo (e=0) = full size; oldest (e=TGHOST_ECHOES-1) = tunnelScale × full size.
+        // Rendered back-to-front so the nearest (largest) echo paints last.
+        int base = segReady.load(memory_order_acquire);
+        if (base < 0) { output.setTo(Scalar(0, 0, 0)); return; }
+
+        int fi[TGHOST_ECHOES];
+        for (int e = 0; e < TGHOST_ECHOES; e++)
+            fi[e] = (base - e * tghostSpacing + BUFFER_SIZE * 10) % BUFFER_SIZE;
+
+        // Same hue palette as Rainbow Ghost
+        float eB[TGHOST_ECHOES], eG[TGHOST_ECHOES], eR[TGHOST_ECHOES];
+        for (int e = 0; e < TGHOST_ECHOES; e++)
+        {
+            float hue = fmod(rainbowHue - e * RAINBOW_HUE_STEP + 360.0f * TGHOST_ECHOES, 360.0f);
+            float h6 = hue / 60.0f;
+            int hi = (int)h6 % 6;
+            float f = h6 - (int)h6, q = 1.0f - f;
+            switch (hi)
+            {
+            case 0: eR[e]=1; eG[e]=f; eB[e]=0; break;
+            case 1: eR[e]=q; eG[e]=1; eB[e]=0; break;
+            case 2: eR[e]=0; eG[e]=1; eB[e]=f; break;
+            case 3: eR[e]=0; eG[e]=q; eB[e]=1; break;
+            case 4: eR[e]=f; eG[e]=0; eB[e]=1; break;
+            default: eR[e]=1; eG[e]=0; eB[e]=q; break;
+            }
+        }
+
+        // Per-echo display scale: newest (e=0)=1.0 (full frame), oldest=tunnelScale (>1 = zoomed in)
+        // inv_s < 1 for older echoes: samples a smaller centre crop → person appears larger than frame
+        float inv_s[TGHOST_ECHOES]; // precompute 1/scale to avoid division in the pixel loop
+        for (int e = 0; e < TGHOST_ECHOES; e++)
+        {
+            float s = 1.0f + (tunnelScale - 1.0f) * (float)e / (TGHOST_ECHOES - 1);
+            inv_s[e] = 1.0f / s;
+        }
+
+        float cx = (width  - 1) * 0.5f;
+        float cy = (height - 1) * 0.5f;
+
+        float ro = ringOffset;
+#pragma omp parallel for schedule(static)
+        for (int y = 0; y < height; y++)
+        {
+            Vec3b *outRow = output.ptr<Vec3b>(y);
+
+            const uchar *maskRowE[TGHOST_ECHOES]  = {};
+            const Vec3b *frameRowE[TGHOST_ECHOES] = {};
+            float ixBias[TGHOST_ECHOES];
+            float dy2 = (y - cy) * (y - cy);
+            for (int e = 0; e < TGHOST_ECHOES; e++)
+            {
+                float sy = cy + (y - cy) * inv_s[e];
+                int iy = (int)(sy + 0.5f);
+                if ((unsigned)iy < (unsigned)height)
+                {
+                    maskRowE[e]  = maskBuffer[fi[e]].ptr<uchar>(iy);
+                    frameRowE[e] = frameBuffer[fi[e]].ptr<Vec3b>(iy);
+                }
+                ixBias[e] = cx * (1.0f - inv_s[e]);
+            }
+
+            for (int x = 0; x < width; x++)
+            {
+                float dist  = sqrtf(dy2 + (x - cx) * (x - cx));
+                float phase = fmodf(dist - ro + RING_SPACING * 1000.0f, RING_SPACING);
+                uchar rv    = (phase < RING_SPACING * 0.5f) ? 35 : 0;
+                outRow[x]   = Vec3b(rv, rv, rv);
+
+                for (int e = TGHOST_ECHOES - 1; e >= 0; e--)
+                {
+                    if (!maskRowE[e]) continue;
+                    int ix = (int)(ixBias[e] + x * inv_s[e] + 0.5f);
+                    if ((unsigned)ix >= (unsigned)width) continue;
+                    int alpha = maskRowE[e][ix];
+                    if (alpha < 13) continue;
+                    const Vec3b &p = frameRowE[e][ix];
+                    float brightness = (0.114f * p[0] + 0.587f * p[1] + 0.299f * p[2])
+                                       * (alpha / 255.0f);
+                    outRow[x] = Vec3b(
+                        (uchar)min(255.0f, eB[e] * brightness),
+                        (uchar)min(255.0f, eG[e] * brightness),
+                        (uchar)min(255.0f, eR[e] * brightness));
+                }
+            }
+        }
+    }
+    else if (currentMode == "flowwarp")
+    {
+        // Optical flow displaces the backdrop sample coordinates per pixel.
+        // Output (x,y) reads from the live frame at (x + vx*scale, y + vy*scale),
+        // smearing the background in the direction of motion.
+        // Person cutout (Vision mask) composited on top unwarped.
+        int recent = (bufIdx - 1 + BUFFER_SIZE * 2) % BUFFER_SIZE;
+        bool hasFlow = !flowMap.empty() && flowMap.rows == height && flowMap.cols == width;
+        float ws  = flowWarpScale;
+        int sr = segReady.load(memory_order_acquire);
+#pragma omp parallel for schedule(static)
+        for (int y = 0; y < height; y++)
+        {
+            Vec3b       *outRow   = output.ptr<Vec3b>(y);
+            const Vec2f *flowRow  = hasFlow ? flowMap.ptr<Vec2f>(y) : nullptr;
+            const uchar *maskRow  = (sr >= 0) ? maskBuffer[sr].ptr<uchar>(y)  : nullptr;
+            const Vec3b *frameRow = (sr >= 0) ? frameBuffer[sr].ptr<Vec3b>(y) : nullptr;
+            for (int x = 0; x < width; x++)
+            {
+                // Warped backdrop sample
+                int sx = x, sy = y;
+                if (flowRow)
+                {
+                    sx = (int)(x + flowRow[x][0] * ws + 0.5f);
+                    sy = (int)(y + flowRow[x][1] * ws + 0.5f);
+                    sx = max(0, min(width  - 1, sx));
+                    sy = max(0, min(height - 1, sy));
+                }
+                outRow[x] = frameBuffer[recent].ptr<Vec3b>(sy)[sx];
+
+                // Person cutout on top, unwarped, soft edges from mask alpha
+                if (maskRow && frameRow)
+                {
+                    int alpha = maskRow[x];
+                    if (alpha > 12)
+                    {
+                        float a = alpha / 255.0f, ia = 1.0f - a;
+                        const Vec3b &p  = frameRow[x];
+                        const Vec3b &bg = outRow[x];
+                        outRow[x] = Vec3b(
+                            (uchar)(p[0] * a + bg[0] * ia),
+                            (uchar)(p[1] * a + bg[1] * ia),
+                            (uchar)(p[2] * a + bg[2] * ia));
+                    }
+                }
+            }
+        }
+    }
+    else if (currentMode == "wavewarp")
+    {
+        // 2D wave simulation seeded by motion, displayed as camera refraction.
+        // Wave equation: new[y][x] = (N+S+E+W)*0.5 - prev[y][x], damped each frame.
+        // Motion map seeds new energy; wave gradient displaces camera sample per pixel.
+        int recent = (bufIdx - 1 + BUFFER_SIZE * 2) % BUFFER_SIZE;
+        bool hasMotion = !motionMap.empty() && motionMap.rows == height && motionMap.cols == width;
+        float refract = waveRefract;
+
+        // Propagate wave: read waveA (current), update waveB (previous) in-place, seed motion
+#pragma omp parallel for schedule(static)
+        for (int y = 1; y < height - 1; y++)
+        {
+            const float *rowAp = waveA.ptr<float>(y - 1);
+            const float *rowA  = waveA.ptr<float>(y);
+            const float *rowAn = waveA.ptr<float>(y + 1);
+                  float *rowB  = waveB.ptr<float>(y);
+            const float *motRow = hasMotion ? motionMap.ptr<float>(y) : nullptr;
+            for (int x = 1; x < width - 1; x++)
+            {
+                float v = (rowAp[x] + rowAn[x] + rowA[x-1] + rowA[x+1]) * 0.5f - rowB[x];
+                v *= WAVE_DAMP;
+                if (motRow) v += motRow[x] * WAVE_SEED;
+                rowB[x] = v;
+            }
+        }
+        std::swap(waveA, waveB); // waveA now holds the freshly propagated result
+
+        // Render: use waveA gradient to refract the full camera frame
+#pragma omp parallel for schedule(static)
+        for (int y = 1; y < height - 1; y++)
+        {
+            Vec3b       *outRow = output.ptr<Vec3b>(y);
+            const float *waveP  = waveA.ptr<float>(y - 1);
+            const float *waveC  = waveA.ptr<float>(y);
+            const float *waveN  = waveA.ptr<float>(y + 1);
+            for (int x = 1; x < width - 1; x++)
+            {
+                float dx = waveC[x + 1] - waveC[x - 1];
+                float dy = waveN[x]     - waveP[x];
+                int sx = (int)(x + dx * refract + 0.5f);
+                int sy = (int)(y + dy * refract + 0.5f);
+                sx = max(0, min(width  - 1, sx));
+                sy = max(0, min(height - 1, sy));
+                outRow[x] = frameBuffer[recent].ptr<Vec3b>(sy)[sx];
+            }
+            outRow[0]       = frameBuffer[recent].ptr<Vec3b>(y)[0];
+            outRow[width-1] = frameBuffer[recent].ptr<Vec3b>(y)[width-1];
+        }
+        // Edge rows: copy direct from camera
+        memcpy(output.ptr(0),          frameBuffer[recent].ptr(0),          width * 3);
+        memcpy(output.ptr(height - 1), frameBuffer[recent].ptr(height - 1), width * 3);
+    }
+    else if (currentMode == "chromawave")
+    {
+        // Three independent wave simulations, each seeded from its own colour channel's diff.
+        // R/G/B channels of the output each sample the camera at coordinates displaced by
+        // their own wave's gradient — different-coloured motion creates independent ripple patterns.
+        int recent  = (bufIdx - 1 + BUFFER_SIZE * 2) % BUFFER_SIZE;
+        int prev_f  = (bufIdx - 1 - MOTION_LOOKBACK + BUFFER_SIZE * 4) % BUFFER_SIZE;
+        float refract = chromaWaveRefract;
+
+        // Propagate all three waves in one OMP pass; seed each from its own colour diff
+#pragma omp parallel for schedule(static)
+        for (int y = 1; y < height - 1; y++)
+        {
+            const float *rAp = waveAr.ptr<float>(y-1), *rA = waveAr.ptr<float>(y), *rAn = waveAr.ptr<float>(y+1); float *rB = waveBr.ptr<float>(y);
+            const float *gAp = waveAg.ptr<float>(y-1), *gA = waveAg.ptr<float>(y), *gAn = waveAg.ptr<float>(y+1); float *gB = waveBg.ptr<float>(y);
+            const float *bAp = waveAb.ptr<float>(y-1), *bA = waveAb.ptr<float>(y), *bAn = waveAb.ptr<float>(y+1); float *bB = waveBb.ptr<float>(y);
+            const Vec3b *currRow = frameBuffer[recent].ptr<Vec3b>(y);
+            const Vec3b *prevRow = frameBuffer[prev_f].ptr<Vec3b>(y);
+            for (int x = 1; x < width - 1; x++)
+            {
+                float dr = abs((int)currRow[x][2] - (int)prevRow[x][2]) * (1.0f/255.0f);
+                float dg = abs((int)currRow[x][1] - (int)prevRow[x][1]) * (1.0f/255.0f);
+                float db = abs((int)currRow[x][0] - (int)prevRow[x][0]) * (1.0f/255.0f);
+                rB[x] = ((rAp[x]+rAn[x]+rA[x-1]+rA[x+1])*0.5f - rB[x]) * WAVE_DAMP + dr * WAVE_SEED;
+                gB[x] = ((gAp[x]+gAn[x]+gA[x-1]+gA[x+1])*0.5f - gB[x]) * WAVE_DAMP + dg * WAVE_SEED;
+                bB[x] = ((bAp[x]+bAn[x]+bA[x-1]+bA[x+1])*0.5f - bB[x]) * WAVE_DAMP + db * WAVE_SEED;
+            }
+        }
+        std::swap(waveAr, waveBr);
+        std::swap(waveAg, waveBg);
+        std::swap(waveAb, waveBb);
+
+        // Render: each colour channel sampled at coordinates displaced by its own wave gradient
+#pragma omp parallel for schedule(static)
+        for (int y = 1; y < height - 1; y++)
+        {
+            Vec3b       *outRow  = output.ptr<Vec3b>(y);
+            const float *rP = waveAr.ptr<float>(y-1), *rC = waveAr.ptr<float>(y), *rN = waveAr.ptr<float>(y+1);
+            const float *gP = waveAg.ptr<float>(y-1), *gC = waveAg.ptr<float>(y), *gN = waveAg.ptr<float>(y+1);
+            const float *bP = waveAb.ptr<float>(y-1), *bC = waveAb.ptr<float>(y), *bN = waveAb.ptr<float>(y+1);
+            for (int x = 1; x < width - 1; x++)
+            {
+                auto clampW = [&](int v, int mx){ return v < 0 ? 0 : v >= mx ? mx-1 : v; };
+
+                int sxR = clampW((int)(x + (rC[x+1]-rC[x-1]) * refract + 0.5f), width);
+                int syR = clampW((int)(y + (rN[x]  -rP[x]  ) * refract + 0.5f), height);
+                int sxG = clampW((int)(x + (gC[x+1]-gC[x-1]) * refract + 0.5f), width);
+                int syG = clampW((int)(y + (gN[x]  -gP[x]  ) * refract + 0.5f), height);
+                int sxB = clampW((int)(x + (bC[x+1]-bC[x-1]) * refract + 0.5f), width);
+                int syB = clampW((int)(y + (bN[x]  -bP[x]  ) * refract + 0.5f), height);
+
+                uchar R = frameBuffer[recent].ptr<Vec3b>(syR)[sxR][2];
+                uchar G = frameBuffer[recent].ptr<Vec3b>(syG)[sxG][1];
+                uchar B = frameBuffer[recent].ptr<Vec3b>(syB)[sxB][0];
+                outRow[x] = Vec3b(B, G, R);
+            }
+            outRow[0]       = frameBuffer[recent].ptr<Vec3b>(y)[0];
+            outRow[width-1] = frameBuffer[recent].ptr<Vec3b>(y)[width-1];
+        }
+        memcpy(output.ptr(0),          frameBuffer[recent].ptr(0),          width * 3);
+        memcpy(output.ptr(height - 1), frameBuffer[recent].ptr(height - 1), width * 3);
     }
     else if (currentMode == "flowripple")
     {
@@ -954,6 +1248,14 @@ string getModeName()
         return "G: Rainbow Ghost";
     if (currentMode == "turbulence")
         return "I: Turbulence";
+    if (currentMode == "tunnelghost")
+        return "B: Tunnel Ghost";
+    if (currentMode == "flowwarp")
+        return "V: Flow Warp";
+    if (currentMode == "wavewarp")
+        return "N: Wave Warp";
+    if (currentMode == "chromawave")
+        return "M: Chroma Wave";
     return "Unknown";
 }
 
@@ -1057,6 +1359,18 @@ int main()
     turbNoiseX.assign(actualWidth, 0.0f);
     turbNoiseY.assign(actualWidth, 0.0f);
 
+    // Pre-allocate wave simulation buffers (Wave Warp mode)
+    waveA = Mat::zeros(actualHeight, actualWidth, CV_32F);
+    waveB = Mat::zeros(actualHeight, actualWidth, CV_32F);
+
+    // Pre-allocate per-channel wave buffers (Chroma Wave mode)
+    waveAr = Mat::zeros(actualHeight, actualWidth, CV_32F);
+    waveBr = Mat::zeros(actualHeight, actualWidth, CV_32F);
+    waveAg = Mat::zeros(actualHeight, actualWidth, CV_32F);
+    waveBg = Mat::zeros(actualHeight, actualWidth, CV_32F);
+    waveAb = Mat::zeros(actualHeight, actualWidth, CV_32F);
+    waveBb = Mat::zeros(actualHeight, actualWidth, CV_32F);
+
     // Pre-allocate background removal mask; MOG2 subtractor created on mode entry
 
     // Pre-allocate temporal ghost mask buffer — one CV_8U mask per frame slot
@@ -1083,7 +1397,10 @@ int main()
     cout << "  Z            - Motion Adaptive" << endl;
     cout << "  X            - Chromatic Time Shift" << endl;
     cout << "  C            - Ghost Echo (7 motion-masked temporal echoes on black)" << endl;
-    cout << "  V            - Background Removal (isolate moving foreground on black)" << endl;
+    cout << "  V            - Flow Warp (optical flow distorts live backdrop; person cutout on top)" << endl;
+    cout << "  N            - Wave Warp (2D wave simulation seeded by motion; camera refraction)" << endl;
+    cout << "  M            - Chroma Wave (3 independent waves, one per RGB channel; per-channel refraction)" << endl;
+    cout << "  B            - Tunnel Ghost (rainbow ghost with echoes scaled into tunnel)" << endl;
     cout << "  Up/Down      - Speed / Chroma / Flow sens / Spread / Echo / Band ht" << endl;
     cout << "  R            - Reset the above to defaults" << endl;
     cout << "  F            - Toggle fullscreen" << endl;
@@ -1178,9 +1495,13 @@ int main()
             turbFrame++;
         }
 
-        // Advance rainbow hue — used by rainbowghost mode.
-        if (currentMode == "rainbowghost")
+        // Advance rainbow hue — used by rainbowghost and tunnelghost modes.
+        if (currentMode == "rainbowghost" || currentMode == "tunnelghost")
             rainbowHue = fmod(rainbowHue + rainbowSpeed / 60.0f, 360.0f);
+        // Advance ring backdrop phase — used by ghost modes and ring warp.
+        if (currentMode == "rainbowghost" || currentMode == "timeghost" ||
+            currentMode == "tunnelghost" || currentMode == "flowwarp")
+            ringOffset = fmodf(ringOffset + RING_SPEED / 60.0f, RING_SPACING);
 
         // Update flow ripple buffer — advect, decay, inject — used by flowripple mode.
         // 1. Build per-pixel backward-warp maps from flowMap.
@@ -1387,6 +1708,30 @@ int main()
             currentMode = "rainbowghost";
             cout << "Mode: " << getModeName() << endl;
         }
+        else if (key == 'b')
+        {
+            currentMode = "tunnelghost";
+            cout << "Mode: " << getModeName() << endl;
+        }
+        else if (key == 'v')
+        {
+            currentMode = "flowwarp";
+            cout << "Mode: " << getModeName() << endl;
+        }
+        else if (key == 'n')
+        {
+            currentMode = "wavewarp";
+            waveA.setTo(0); waveB.setTo(0);
+            cout << "Mode: " << getModeName() << endl;
+        }
+        else if (key == 'm')
+        {
+            currentMode = "chromawave";
+            waveAr.setTo(0); waveBr.setTo(0);
+            waveAg.setTo(0); waveBg.setTo(0);
+            waveAb.setTo(0); waveBb.setTo(0);
+            cout << "Mode: " << getModeName() << endl;
+        }
         else if (key == 'f')
         {
             isFullscreen = !isFullscreen;
@@ -1450,6 +1795,26 @@ int main()
             {
                 tghostSpacing = 20;
                 overlayText = "Spacing: " + to_string(tghostSpacing);
+            }
+            else if (currentMode == "tunnelghost")
+            {
+                tunnelScale = 3.0f;
+                overlayText = "Zoom: " + to_string(tunnelScale).substr(0, 3) + "x";
+            }
+            else if (currentMode == "flowwarp")
+            {
+                flowWarpScale = 10.0f;
+                overlayText = "Warp: " + to_string((int)flowWarpScale);
+            }
+            else if (currentMode == "wavewarp")
+            {
+                waveRefract = 15.0f;
+                overlayText = "Refract: " + to_string((int)waveRefract);
+            }
+            else if (currentMode == "chromawave")
+            {
+                chromaWaveRefract = 15.0f;
+                overlayText = "Refract: " + to_string((int)chromaWaveRefract);
             }
             else
             {
@@ -1517,6 +1882,26 @@ int main()
                 tghostSpacing = min(BUFFER_SIZE / TGHOST_ECHOES, tghostSpacing + 1);
                 overlayText = "Spacing: " + to_string(tghostSpacing);
             }
+            else if (currentMode == "tunnelghost")
+            {
+                tunnelScale = min(8.0f, tunnelScale + 0.5f);
+                overlayText = "Zoom: " + to_string(tunnelScale).substr(0, 3) + "x";
+            }
+            else if (currentMode == "flowwarp")
+            {
+                flowWarpScale = min(50.0f, flowWarpScale + 2.0f);
+                overlayText = "Warp: " + to_string((int)flowWarpScale);
+            }
+            else if (currentMode == "wavewarp")
+            {
+                waveRefract = min(50.0f, waveRefract + 2.0f);
+                overlayText = "Refract: " + to_string((int)waveRefract);
+            }
+            else if (currentMode == "chromawave")
+            {
+                chromaWaveRefract = min(50.0f, chromaWaveRefract + 2.0f);
+                overlayText = "Refract: " + to_string((int)chromaWaveRefract);
+            }
             else
             {
                 updateSpeed.store(min(BUFFER_SIZE, updateSpeed.load() + 1));
@@ -1582,6 +1967,26 @@ int main()
             {
                 tghostSpacing = max(1, tghostSpacing - 1);
                 overlayText = "Spacing: " + to_string(tghostSpacing);
+            }
+            else if (currentMode == "tunnelghost")
+            {
+                tunnelScale = max(1.2f, tunnelScale - 0.5f);
+                overlayText = "Zoom: " + to_string(tunnelScale).substr(0, 3) + "x";
+            }
+            else if (currentMode == "flowwarp")
+            {
+                flowWarpScale = max(1.0f, flowWarpScale - 2.0f);
+                overlayText = "Warp: " + to_string((int)flowWarpScale);
+            }
+            else if (currentMode == "wavewarp")
+            {
+                waveRefract = max(1.0f, waveRefract - 2.0f);
+                overlayText = "Refract: " + to_string((int)waveRefract);
+            }
+            else if (currentMode == "chromawave")
+            {
+                chromaWaveRefract = max(1.0f, chromaWaveRefract - 2.0f);
+                overlayText = "Refract: " + to_string((int)chromaWaveRefract);
             }
             else
             {

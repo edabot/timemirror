@@ -130,7 +130,10 @@ This project captures live webcam footage and applies a time-displacement effect
 - **Z** - Motion Adaptive (displacement intensity scales with per-pixel motion)
 - **X** - Chromatic Time Shift (R/G/B channels pulled from slightly different frames)
 - **C** - Ghost Echo (7 motion-masked temporal echoes composited on black)
-- **V** - Background Removal (isolate moving foreground on black)
+- **V** - Flow Warp (optical flow displaces live camera; motion warps the image)
+- **N** - Wave Warp (2D wave simulation seeded by motion; gradients refract full frame)
+- **M** - Chroma Wave (three independent waves per RGB channel; per-channel chromatic refraction)
+- **B** - Tunnel Ghost (rainbow ghost echoes zoomed in; oldest echo largest, creating an expanding tunnel)
 
 ### Controls
 - **Arrow Up/Down** - Adjust speed (lines per frame)

@@ -77,9 +77,12 @@ Produces `TimeMirror_notarized.zip` — trusted by Gatekeeper on any Mac.
 | **Z** | Motion Adaptive | Displacement intensity scales with per-pixel motion |
 | **X** | Chromatic Time Shift | R/G/B channels pulled from slightly different frame offsets |
 | **C** | Ghost Echo | 7 motion-masked temporal echoes composited on black |
-| **V** | Background Removal | Isolate moving foreground on black |
+| **V** | Flow Warp | Optical flow displaces the live camera feed — motion warps the image |
+| **N** | Wave Warp | 2D wave simulation seeded by motion; gradients refract the camera |
+| **M** | Chroma Wave | Three independent waves (one per RGB channel) create per-channel chromatic refraction |
+| **B** | Tunnel Ghost | Rainbow ghost with echoes zoomed in — oldest echo largest, creating an expanding tunnel |
 
-> **G and H modes** use Apple's Vision framework (built into macOS 12+) — no Python or MediaPipe required.
+> **G, H, and B modes** use Apple's Vision framework (built into macOS 12+) — no Python or MediaPipe required.
 
 ### Other Controls
 
