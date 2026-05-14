@@ -170,16 +170,30 @@ float ringOffset = 0.0f;   // expanding ring backdrop phase (px, advances each f
 const float RING_SPACING = 200.0f;
 const float RING_SPEED   = 75.0f;
 
+// ── Mode enum — single authoritative list of all mode identifiers ─────────────
+// Using enum class prevents silent typos: an invalid name is a compile error.
+enum class Mode {
+    S, W, A, D, WS, AD,
+    MOTION, CHROMA, MCHROMA,
+    PRISMATIC, PRISMATICGHOST,
+    FLOWRIPPLE, FLOWHUE,
+    DATAMOSH, TURBULENCE,
+    GHOSTECHO, CHROMAGHOSTECHO,
+    TIMEGHOST, TUNNELTIMEGHOST,
+    RAINBOWGHOST, TUNNELGHOST,
+    FLOWWARP, WAVEWARP, CHROMAWAVE
+};
+
 // Main-thread-only state
-string currentMode = "s";
+Mode currentMode = Mode::S;
 // Toggle-pair memory: remembers which variant was last active so returning to a key
 // restores the exact mode the user left, not always the primary variant.
-string lastT = "prismatic";
-string lastY = "flowripple";
-string lastG = "rainbowghost";
-string lastH = "timeghost";
-string lastC = "ghostecho";
-string lastK = "wavewarp";
+Mode lastT = Mode::PRISMATIC;
+Mode lastY = Mode::FLOWRIPPLE;
+Mode lastG = Mode::RAINBOWGHOST;
+Mode lastH = Mode::TIMEGHOST;
+Mode lastC = Mode::GHOSTECHO;
+Mode lastK = Mode::WAVEWARP;
 map<char, steady_clock::time_point> lastKeyTime;
 const double COMBO_WINDOW = 0.5;
 
@@ -361,9 +375,9 @@ void preprocessLoop(int actualWidth, int actualHeight)
         int latest = (writeIndex.load(memory_order_acquire) - 1 + BUFFER_SIZE) % BUFFER_SIZE;
         if (latest == lastPrepped) { this_thread::yield(); continue; }
 
-        string mode = currentMode;
+        Mode mode = currentMode;
 
-        if (mode == "motion" || mode == "mchroma" || mode == "ghostecho" || mode == "chromaghostecho" || mode == "wavewarp")
+        if (mode == Mode::MOTION || mode == Mode::MCHROMA || mode == Mode::GHOSTECHO || mode == Mode::CHROMAGHOSTECHO || mode == Mode::WAVEWARP)
         {
             int recent = latest;
             int older  = (latest - MOTION_LOOKBACK + BUFFER_SIZE * 2) % BUFFER_SIZE;
@@ -376,7 +390,7 @@ void preprocessLoop(int actualWidth, int actualHeight)
             prepBuf.store(writeBuf, memory_order_release);
             writeBuf = 1 - writeBuf;
         }
-        else if (mode == "flowhue" || mode == "flowripple" || mode == "flowwarp")
+        else if (mode == Mode::FLOWHUE || mode == Mode::FLOWRIPPLE || mode == Mode::FLOWWARP)
         {
             int recent = latest;
             int older  = (latest - 1 + BUFFER_SIZE) % BUFFER_SIZE;
@@ -398,7 +412,7 @@ void preprocessLoop(int actualWidth, int actualHeight)
 }
 
 // ── Key combo detection ───────────────────────────────────────────────────────
-string checkForCombo(char keyPressed)
+Mode checkForCombo(char keyPressed)
 {
     auto currentTime = steady_clock::now();
     lastKeyTime[keyPressed] = currentTime;
@@ -410,9 +424,9 @@ string checkForCombo(char keyPressed)
         {
             double dt = duration<double>(currentTime - lastKeyTime[other]).count();
             if (dt < COMBO_WINDOW)
-                return "ws";
+                return Mode::WS;
         }
-        return string(1, keyPressed);
+        return (keyPressed == 'w') ? Mode::W : Mode::S;
     }
     if (keyPressed == 'a' || keyPressed == 'd')
     {
@@ -421,11 +435,11 @@ string checkForCombo(char keyPressed)
         {
             double dt = duration<double>(currentTime - lastKeyTime[other]).count();
             if (dt < COMBO_WINDOW)
-                return "ad";
+                return Mode::AD;
         }
-        return string(1, keyPressed);
+        return (keyPressed == 'a') ? Mode::A : Mode::D;
     }
-    return string(1, keyPressed);
+    return Mode::S; // unreachable
 }
 
 // ── Time displacement ─────────────────────────────────────────────────────────
@@ -438,7 +452,7 @@ string checkForCombo(char keyPressed)
 // no data races.
 void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
 {
-    if (currentMode == "ws")
+    if (currentMode == Mode::WS)
     {
         int centerY = height / 2;
 #pragma omp parallel for schedule(static)
@@ -449,7 +463,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
             frameBuffer[frameOffset].row(y).copyTo(output.row(y));
         }
     }
-    else if (currentMode == "ad")
+    else if (currentMode == Mode::AD)
     {
         int centerX = width / 2;
         vector<int> colFrame(width);
@@ -479,7 +493,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
                 memcpy(output.ptr(y) + off, frameBuffer[s.frame].ptr(y) + off, nb);
         }
     }
-    else if (currentMode == "w")
+    else if (currentMode == Mode::W)
     {
 #pragma omp parallel for schedule(static)
         for (int y = 0; y < height; y++)
@@ -488,7 +502,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
             frameBuffer[frameOffset].row(y).copyTo(output.row(y));
         }
     }
-    else if (currentMode == "s")
+    else if (currentMode == Mode::S)
     {
 #pragma omp parallel for schedule(static)
         for (int y = 0; y < height; y++)
@@ -497,7 +511,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
             frameBuffer[frameOffset].row(y).copyTo(output.row(y));
         }
     }
-    else if (currentMode == "a")
+    else if (currentMode == Mode::A)
     {
         vector<int> colFrame(width);
         for (int x = 0; x < width; x++)
@@ -519,7 +533,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
                 memcpy(output.ptr(y) + off, frameBuffer[s.frame].ptr(y) + off, nb);
         }
     }
-    else if (currentMode == "d")
+    else if (currentMode == Mode::D)
     {
         vector<int> colFrame(width);
         for (int x = 0; x < width; x++)
@@ -541,7 +555,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
                 memcpy(output.ptr(y) + off, frameBuffer[s.frame].ptr(y) + off, nb);
         }
     }
-    else if (currentMode == "motion")
+    else if (currentMode == Mode::MOTION)
     {
 // Per-pixel: still areas sample the current frame, moving areas sample
 // further back in time — motion creates long temporal trails.
@@ -560,7 +574,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
             }
         }
     }
-    else if (currentMode == "chroma")
+    else if (currentMode == Mode::CHROMA)
     {
         // B channel from most recent frame, G from CHROMA_OFFSET frames ago,
         // R from 2×CHROMA_OFFSET frames ago. Still objects look normal; moving
@@ -574,7 +588,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
         const int fromTo[] = {0, 0, 4, 1, 8, 2}; // B←frame0, G←frame1, R←frame2
         cv::mixChannels(sources, 3, &output, 1, fromTo, 3);
     }
-    else if (currentMode == "mchroma")
+    else if (currentMode == Mode::MCHROMA)
     {
         // Per-pixel motion-adaptive chromatic aberration.
         // Still pixels (motion=0) show the current frame unchanged.
@@ -600,7 +614,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
             }
         }
     }
-    else if (currentMode == "prismatic")
+    else if (currentMode == Mode::PRISMATIC)
     {
         // 6 temporal echoes, each tinted with an evenly-spaced hue (red→yellow→green→
         // cyan→blue→magenta). Echoes are additively combined per channel.
@@ -633,11 +647,11 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
             }
         }
     }
-    else if (currentMode == "datamosh")
+    else if (currentMode == Mode::DATAMOSH)
     {
         // Output already written by the fused preprocessing loop — nothing to do here.
     }
-    else if (currentMode == "ghostecho")
+    else if (currentMode == Mode::GHOSTECHO)
     {
         // 7 temporal echoes stacked with triangular weights (newest = brightest).
         // motionMap masks the output: still areas → black, moving areas → ghost stack.
@@ -676,7 +690,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
             }
         }
     }
-    else if (currentMode == "chromaghostecho")
+    else if (currentMode == Mode::CHROMAGHOSTECHO)
     {
         // Ghost Echo variant: each echo tinted a cycling hue (like Rainbow Ghost but motion-masked).
         // Per-echo luma × hue replaces the neutral weighted blend; rainbowHue cycles each frame.
@@ -730,7 +744,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
             }
         }
     }
-    else if (currentMode == "prismaticghost")
+    else if (currentMode == Mode::PRISMATICGHOST)
     {
         // Person masks from Vision segmentation, each echo tinted a spectral hue (like T but
         // on masked silhouettes). Echoes blended additively so overlaps become brighter;
@@ -806,7 +820,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
             }
         }
     }
-    else if (currentMode == "timeghost")
+    else if (currentMode == Mode::TIMEGHOST)
     {
         // Composite TGHOST_ECHOES silhouettes of the person from different moments in time.
         // maskBuffer provides per-pixel person masks (255=person, 0=background).
@@ -864,7 +878,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
             }
         }
     }
-    else if (currentMode == "rainbowghost")
+    else if (currentMode == Mode::RAINBOWGHOST)
     {
         // Like Temporal Ghost but each echo is tinted a single hue instead of using
         // natural colour. Hues are spaced RAINBOW_HUE_STEP degrees apart and the base
@@ -966,7 +980,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
             }
         }
     }
-    else if (currentMode == "tunneltimeghost")
+    else if (currentMode == Mode::TUNNELTIMEGHOST)
     {
         // Temporal Ghost variant: each older echo is scaled up toward centre (same tunnel
         // geometry as Tunnel Ghost) but uses natural colour + brightness fade like Temporal Ghost.
@@ -1036,7 +1050,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
             }
         }
     }
-    else if (currentMode == "tunnelghost")
+    else if (currentMode == Mode::TUNNELGHOST)
     {
         // Rainbow Ghost variant where each older echo is scaled down toward the image centre,
         // creating a receding tunnel of coloured person silhouettes.
@@ -1127,7 +1141,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
             }
         }
     }
-    else if (currentMode == "flowwarp")
+    else if (currentMode == Mode::FLOWWARP)
     {
         // Optical flow displaces the backdrop sample coordinates per pixel.
         // Output (x,y) reads from the live frame at (x + vx*scale, y + vy*scale),
@@ -1175,7 +1189,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
             }
         }
     }
-    else if (currentMode == "wavewarp")
+    else if (currentMode == Mode::WAVEWARP)
     {
         // 2D wave simulation seeded by motion, displayed as camera refraction.
         // Wave equation: new[y][x] = (N+S+E+W)*0.5 - prev[y][x], damped each frame.
@@ -1228,7 +1242,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
         memcpy(output.ptr(0),          frameBuffer[recent].ptr(0),          width * 3);
         memcpy(output.ptr(height - 1), frameBuffer[recent].ptr(height - 1), width * 3);
     }
-    else if (currentMode == "chromawave")
+    else if (currentMode == Mode::CHROMAWAVE)
     {
         // Three independent wave simulations, each seeded from its own colour channel's diff.
         // R/G/B channels of the output each sample the camera at coordinates displaced by
@@ -1297,7 +1311,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
         memcpy(output.ptr(0),          frameBuffer[recent].ptr(0),          width * 3);
         memcpy(output.ptr(height - 1), frameBuffer[recent].ptr(height - 1), width * 3);
     }
-    else if (currentMode == "flowripple")
+    else if (currentMode == Mode::FLOWRIPPLE)
     {
         // rippleBuffer is maintained by the preprocessing block (advect + decay + inject).
         // Convert to 8-bit (saturating) and add additively over the current frame so
@@ -1306,7 +1320,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
         rippleBuffer.convertTo(ripple8, CV_8UC3, 1.0);
         cv::add(frameBuffer[recent], ripple8, output);
     }
-    else if (currentMode == "turbulence")
+    else if (currentMode == Mode::TURBULENCE)
     {
         // turbulenceMap is maintained by the preprocessing block.
         // Per-pixel: turbulence level (0=still, 1=max) drives:
@@ -1363,7 +1377,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
             }
         }
     }
-    else if (currentMode == "flowhue")
+    else if (currentMode == Mode::FLOWHUE)
     {
         // Each pixel: hue = optical flow direction, saturation = flow speed,
         // value = pixel brightness from current frame.
@@ -1435,54 +1449,32 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
 
 string getModeName()
 {
-    if (currentMode == "w")
-        return "W: Bottom to Top";
-    if (currentMode == "s")
-        return "S: Top to Bottom";
-    if (currentMode == "a")
-        return "A: Right to Left";
-    if (currentMode == "d")
-        return "D: Left to Right";
-    if (currentMode == "ws")
-        return "W+S: Center-Out Vertical";
-    if (currentMode == "ad")
-        return "A+D: Center-Out Horizontal";
-    if (currentMode == "motion")
-        return "Z: Motion Adaptive";
-    if (currentMode == "chroma")
-        return "X: Chromatic Time Shift";
-    if (currentMode == "mchroma")
-        return "J: Motion Chromatic";
-    if (currentMode == "prismatic")
-        return "T: Prismatic Echo";
-    if (currentMode == "flowhue")
-        return "K: Flow Direction Color";
-    if (currentMode == "flowripple")
-        return "Y: Flow Color Ripple";
-    if (currentMode == "datamosh")
-        return "U: Datamosh";
-    if (currentMode == "ghostecho")
-        return "C: Ghost Echo";
-    if (currentMode == "chromaghostecho")
-        return "C: Chroma Ghost Echo";
-    if (currentMode == "timeghost")
-        return "H: Temporal Ghost";
-    if (currentMode == "tunneltimeghost")
-        return "H: Tunnel Time Ghost";
-    if (currentMode == "rainbowghost")
-        return "G: Rainbow Ghost";
-    if (currentMode == "turbulence")
-        return "I: Turbulence";
-    if (currentMode == "tunnelghost")
-        return "B: Tunnel Ghost";
-    if (currentMode == "prismaticghost")
-        return "B: Prismatic Ghost";
-    if (currentMode == "flowwarp")
-        return "V: Flow Warp";
-    if (currentMode == "wavewarp")
-        return "N: Wave Warp";
-    if (currentMode == "chromawave")
-        return "M: Chroma Wave";
+    switch (currentMode) {
+        case Mode::W:              return "W: Bottom to Top";
+        case Mode::S:              return "S: Top to Bottom";
+        case Mode::A:              return "A: Right to Left";
+        case Mode::D:              return "D: Left to Right";
+        case Mode::WS:             return "W+S: Center-Out Vertical";
+        case Mode::AD:             return "A+D: Center-Out Horizontal";
+        case Mode::MOTION:         return "Z: Motion Adaptive";
+        case Mode::CHROMA:         return "X: Chromatic Time Shift";
+        case Mode::MCHROMA:        return "J: Motion Chromatic";
+        case Mode::PRISMATIC:      return "T: Prismatic Echo";
+        case Mode::PRISMATICGHOST: return "T: Prismatic Ghost";
+        case Mode::FLOWHUE:        return "Y: Flow Direction Color";
+        case Mode::FLOWRIPPLE:     return "Y: Flow Color Ripple";
+        case Mode::DATAMOSH:       return "U: Datamosh";
+        case Mode::TURBULENCE:     return "I: Turbulence";
+        case Mode::GHOSTECHO:      return "C: Ghost Echo";
+        case Mode::CHROMAGHOSTECHO:return "C: Chroma Ghost Echo";
+        case Mode::TIMEGHOST:      return "H: Temporal Ghost";
+        case Mode::TUNNELTIMEGHOST:return "H: Tunnel Time Ghost";
+        case Mode::RAINBOWGHOST:   return "G: Rainbow Ghost";
+        case Mode::TUNNELGHOST:    return "G: Tunnel Ghost";
+        case Mode::FLOWWARP:       return "V: Flow Warp";
+        case Mode::WAVEWARP:       return "K: Wave Warp";
+        case Mode::CHROMAWAVE:     return "K: Chroma Wave";
+    }
     return "Unknown";
 }
 
@@ -1675,7 +1667,7 @@ int main()
         // is large enough to be visible at 60fps. Adjacent frames produce near-zero
         // diffs that collapse the accumulator to black before trails can build up.
         // Reuses diffMat (CV_8UC3) scratch buffer already declared for motion mode.
-        if (currentMode == "datamosh")
+        if (currentMode == Mode::DATAMOSH)
         {
             int curr = (bufIdx - 1 + BUFFER_SIZE * 2) % BUFFER_SIZE;
             int prev = (bufIdx - 1 - MOTION_LOOKBACK + BUFFER_SIZE * 2) % BUFFER_SIZE;
@@ -1705,7 +1697,7 @@ int main()
         // Update turbulence accumulator — used by turbulence mode.
         // Diffs current vs MOTION_LOOKBACK frames ago, blurs spatially, then IIR-decays
         // into turbulenceMap. Still areas fade to 0 over ~2s; motion spikes quickly to 1.
-        if (currentMode == "turbulence")
+        if (currentMode == Mode::TURBULENCE)
         {
             int recent = (bufIdx - 1 + BUFFER_SIZE * 2) % BUFFER_SIZE;
             int older = (bufIdx - 1 - MOTION_LOOKBACK + BUFFER_SIZE * 2) % BUFFER_SIZE;
@@ -1723,13 +1715,13 @@ int main()
         }
 
         // Advance rainbow hue — used by rainbowghost and tunnelghost modes.
-        if (currentMode == "rainbowghost" || currentMode == "tunnelghost" ||
-            currentMode == "chromaghostecho" || currentMode == "prismaticghost")
+        if (currentMode == Mode::RAINBOWGHOST || currentMode == Mode::TUNNELGHOST ||
+            currentMode == Mode::CHROMAGHOSTECHO || currentMode == Mode::PRISMATICGHOST)
             rainbowHue = fmod(rainbowHue + rainbowSpeed / 60.0f, 360.0f);
         // Advance ring backdrop phase — used by ghost modes and ring warp.
-        if (currentMode == "rainbowghost" || currentMode == "timeghost" ||
-            currentMode == "tunnelghost" || currentMode == "tunneltimeghost" ||
-            currentMode == "prismaticghost" || currentMode == "flowwarp")
+        if (currentMode == Mode::RAINBOWGHOST || currentMode == Mode::TIMEGHOST ||
+            currentMode == Mode::TUNNELGHOST || currentMode == Mode::TUNNELTIMEGHOST ||
+            currentMode == Mode::PRISMATICGHOST || currentMode == Mode::FLOWWARP)
             ringOffset = fmodf(ringOffset + RING_SPEED / 60.0f, RING_SPACING);
 
         // Update flow ripple buffer — advect, decay, inject — used by flowripple mode.
@@ -1737,7 +1729,7 @@ int main()
         // 2. remap advects existing color content forward (in the flow direction).
         // 3. Decay: multiply by P_rippleDecay.value (~1 second lifetime at 60fps).
         // 4. Inject: where flow is strong, add a fresh saturated directional color additively.
-        if (currentMode == "flowripple")
+        if (currentMode == Mode::FLOWRIPPLE)
         {
             const float PI2 = 2.0f * 3.14159265f;
             const float invSens = 1.0f / P_flowSens.value;
@@ -1880,23 +1872,23 @@ int main()
         }
         else if (key == 'z')
         {
-            currentMode = "motion";
+            currentMode = Mode::MOTION;
             cout << "Mode: " << getModeName() << endl;
         }
         else if (key == 'x')
         {
-            currentMode = "chroma";
+            currentMode = Mode::CHROMA;
             cout << "Mode: " << getModeName() << endl;
         }
         else if (key == 'j')
         {
-            currentMode = "mchroma";
+            currentMode = Mode::MCHROMA;
             cout << "Mode: " << getModeName() << endl;
         }
         else if (key == 't')
         {
-            if (currentMode == "prismatic" || currentMode == "prismaticghost")
-                currentMode = (currentMode == "prismatic") ? "prismaticghost" : "prismatic";
+            if (currentMode == Mode::PRISMATIC || currentMode == Mode::PRISMATICGHOST)
+                currentMode = (currentMode == Mode::PRISMATIC) ? Mode::PRISMATICGHOST : Mode::PRISMATIC;
             else
                 currentMode = lastT;
             lastT = currentMode;
@@ -1904,31 +1896,31 @@ int main()
         }
         else if (key == 'y')
         {
-            if (currentMode == "flowripple" || currentMode == "flowhue")
-                currentMode = (currentMode == "flowripple") ? "flowhue" : "flowripple";
+            if (currentMode == Mode::FLOWRIPPLE || currentMode == Mode::FLOWHUE)
+                currentMode = (currentMode == Mode::FLOWRIPPLE) ? Mode::FLOWHUE : Mode::FLOWRIPPLE;
             else
                 currentMode = lastY;
             lastY = currentMode;
-            if (currentMode == "flowripple") rippleBuffer.setTo(0);
+            if (currentMode == Mode::FLOWRIPPLE) rippleBuffer.setTo(0);
             cout << "Mode: " << getModeName() << endl;
         }
         else if (key == 'i')
         {
-            currentMode = "turbulence";
+            currentMode = Mode::TURBULENCE;
             turbulenceMap.setTo(0);
             turbFrame = 0;
             cout << "Mode: " << getModeName() << endl;
         }
         else if (key == 'u')
         {
-            currentMode = "datamosh";
+            currentMode = Mode::DATAMOSH;
             datamoshAccum.setTo(0); // fresh slate each entry
             cout << "Mode: " << getModeName() << endl;
         }
         else if (key == 'c')
         {
-            if (currentMode == "ghostecho" || currentMode == "chromaghostecho")
-                currentMode = (currentMode == "ghostecho") ? "chromaghostecho" : "ghostecho";
+            if (currentMode == Mode::GHOSTECHO || currentMode == Mode::CHROMAGHOSTECHO)
+                currentMode = (currentMode == Mode::GHOSTECHO) ? Mode::CHROMAGHOSTECHO : Mode::GHOSTECHO;
             else
                 currentMode = lastC;
             lastC = currentMode;
@@ -1936,8 +1928,8 @@ int main()
         }
         else if (key == 'h')
         {
-            if (currentMode == "timeghost" || currentMode == "tunneltimeghost")
-                currentMode = (currentMode == "timeghost") ? "tunneltimeghost" : "timeghost";
+            if (currentMode == Mode::TIMEGHOST || currentMode == Mode::TUNNELTIMEGHOST)
+                currentMode = (currentMode == Mode::TIMEGHOST) ? Mode::TUNNELTIMEGHOST : Mode::TIMEGHOST;
             else
                 currentMode = lastH;
             lastH = currentMode;
@@ -1945,8 +1937,8 @@ int main()
         }
         else if (key == 'g')
         {
-            if (currentMode == "rainbowghost" || currentMode == "tunnelghost")
-                currentMode = (currentMode == "rainbowghost") ? "tunnelghost" : "rainbowghost";
+            if (currentMode == Mode::RAINBOWGHOST || currentMode == Mode::TUNNELGHOST)
+                currentMode = (currentMode == Mode::RAINBOWGHOST) ? Mode::TUNNELGHOST : Mode::RAINBOWGHOST;
             else
                 currentMode = lastG;
             lastG = currentMode;
@@ -1954,17 +1946,17 @@ int main()
         }
         else if (key == 'v')
         {
-            currentMode = "flowwarp";
+            currentMode = Mode::FLOWWARP;
             cout << "Mode: " << getModeName() << endl;
         }
         else if (key == 'k')
         {
-            if (currentMode == "wavewarp" || currentMode == "chromawave")
-                currentMode = (currentMode == "wavewarp") ? "chromawave" : "wavewarp";
+            if (currentMode == Mode::WAVEWARP || currentMode == Mode::CHROMAWAVE)
+                currentMode = (currentMode == Mode::WAVEWARP) ? Mode::CHROMAWAVE : Mode::WAVEWARP;
             else
                 currentMode = lastK;
             lastK = currentMode;
-            if (currentMode == "chromawave") {
+            if (currentMode == Mode::CHROMAWAVE) {
                 waveAr.setTo(0); waveBr.setTo(0);
                 waveAg.setTo(0); waveBg.setTo(0);
                 waveAb.setTo(0); waveBb.setTo(0);
@@ -1984,21 +1976,21 @@ int main()
         {
             // Returns the Param to reset for the current mode, or nullptr for speed reset.
             ModeParam* p = nullptr;
-            if      (currentMode == "motion")                                     p = &P_motionDepth;
-            else if (currentMode == "chroma")                                     p = &P_chromaOffset;
-            else if (currentMode == "flowhue")                                    p = &P_flowSens;
-            else if (currentMode == "mchroma")                                    p = &P_chromaSpread;
-            else if (currentMode == "prismatic")                                  p = &P_echoSpacing;
-            else if (currentMode == "datamosh")                                   p = &P_datamosh;
-            else if (currentMode == "flowripple")                                 p = &P_rippleDecay;
-            else if (currentMode == "turbulence")                                 p = &P_turbShift;
-            else if (currentMode == "ghostecho" || currentMode == "chromaghostecho") p = &P_ghostSpace;
-            else if (currentMode == "timeghost"  || currentMode == "rainbowghost")   p = &P_tghostSpace;
-            else if (currentMode == "tunnelghost" || currentMode == "tunneltimeghost") p = &P_tunnelScale;
-            else if (currentMode == "prismaticghost")                             p = &P_glowBoost;
-            else if (currentMode == "flowwarp")                                   p = &P_flowWarp;
-            else if (currentMode == "wavewarp")                                   p = &P_waveRefract;
-            else if (currentMode == "chromawave")                                 p = &P_chromaWave;
+            if      (currentMode == Mode::MOTION)                                     p = &P_motionDepth;
+            else if (currentMode == Mode::CHROMA)                                     p = &P_chromaOffset;
+            else if (currentMode == Mode::FLOWHUE)                                    p = &P_flowSens;
+            else if (currentMode == Mode::MCHROMA)                                    p = &P_chromaSpread;
+            else if (currentMode == Mode::PRISMATIC)                                  p = &P_echoSpacing;
+            else if (currentMode == Mode::DATAMOSH)                                   p = &P_datamosh;
+            else if (currentMode == Mode::FLOWRIPPLE)                                 p = &P_rippleDecay;
+            else if (currentMode == Mode::TURBULENCE)                                 p = &P_turbShift;
+            else if (currentMode == Mode::GHOSTECHO || currentMode == Mode::CHROMAGHOSTECHO) p = &P_ghostSpace;
+            else if (currentMode == Mode::TIMEGHOST  || currentMode == Mode::RAINBOWGHOST)   p = &P_tghostSpace;
+            else if (currentMode == Mode::TUNNELGHOST || currentMode == Mode::TUNNELTIMEGHOST) p = &P_tunnelScale;
+            else if (currentMode == Mode::PRISMATICGHOST)                             p = &P_glowBoost;
+            else if (currentMode == Mode::FLOWWARP)                                   p = &P_flowWarp;
+            else if (currentMode == Mode::WAVEWARP)                                   p = &P_waveRefract;
+            else if (currentMode == Mode::CHROMAWAVE)                                 p = &P_chromaWave;
             if (p) { p->reset(); overlayText = p->display(); }
             else   { updateSpeed.store(1); overlayText = "Speed: 1"; }
             cout << overlayText << endl;
@@ -2008,21 +2000,21 @@ int main()
         else if (key == 0)
         { // Up arrow (Mac)
             ModeParam* p = nullptr;
-            if      (currentMode == "motion")                                     p = &P_motionDepth;
-            else if (currentMode == "chroma")                                     p = &P_chromaOffset;
-            else if (currentMode == "flowhue")                                    p = &P_flowSens;
-            else if (currentMode == "mchroma")                                    p = &P_chromaSpread;
-            else if (currentMode == "prismatic")                                  p = &P_echoSpacing;
-            else if (currentMode == "datamosh")                                   p = &P_datamosh;
-            else if (currentMode == "flowripple")                                 p = &P_rippleDecay;
-            else if (currentMode == "turbulence")                                 p = &P_turbShift;
-            else if (currentMode == "ghostecho" || currentMode == "chromaghostecho") p = &P_ghostSpace;
-            else if (currentMode == "timeghost"  || currentMode == "rainbowghost")   p = &P_tghostSpace;
-            else if (currentMode == "tunnelghost" || currentMode == "tunneltimeghost") p = &P_tunnelScale;
-            else if (currentMode == "prismaticghost")                             p = &P_glowBoost;
-            else if (currentMode == "flowwarp")                                   p = &P_flowWarp;
-            else if (currentMode == "wavewarp")                                   p = &P_waveRefract;
-            else if (currentMode == "chromawave")                                 p = &P_chromaWave;
+            if      (currentMode == Mode::MOTION)                                     p = &P_motionDepth;
+            else if (currentMode == Mode::CHROMA)                                     p = &P_chromaOffset;
+            else if (currentMode == Mode::FLOWHUE)                                    p = &P_flowSens;
+            else if (currentMode == Mode::MCHROMA)                                    p = &P_chromaSpread;
+            else if (currentMode == Mode::PRISMATIC)                                  p = &P_echoSpacing;
+            else if (currentMode == Mode::DATAMOSH)                                   p = &P_datamosh;
+            else if (currentMode == Mode::FLOWRIPPLE)                                 p = &P_rippleDecay;
+            else if (currentMode == Mode::TURBULENCE)                                 p = &P_turbShift;
+            else if (currentMode == Mode::GHOSTECHO || currentMode == Mode::CHROMAGHOSTECHO) p = &P_ghostSpace;
+            else if (currentMode == Mode::TIMEGHOST  || currentMode == Mode::RAINBOWGHOST)   p = &P_tghostSpace;
+            else if (currentMode == Mode::TUNNELGHOST || currentMode == Mode::TUNNELTIMEGHOST) p = &P_tunnelScale;
+            else if (currentMode == Mode::PRISMATICGHOST)                             p = &P_glowBoost;
+            else if (currentMode == Mode::FLOWWARP)                                   p = &P_flowWarp;
+            else if (currentMode == Mode::WAVEWARP)                                   p = &P_waveRefract;
+            else if (currentMode == Mode::CHROMAWAVE)                                 p = &P_chromaWave;
             if (p) { p->up(); overlayText = p->display(); }
             else   { updateSpeed.store(min(BUFFER_SIZE, updateSpeed.load() + 1));
                      overlayText = "Speed: " + to_string(updateSpeed.load()); }
@@ -2033,21 +2025,21 @@ int main()
         else if (key == 1)
         { // Down arrow (Mac)
             ModeParam* p = nullptr;
-            if      (currentMode == "motion")                                     p = &P_motionDepth;
-            else if (currentMode == "chroma")                                     p = &P_chromaOffset;
-            else if (currentMode == "flowhue")                                    p = &P_flowSens;
-            else if (currentMode == "mchroma")                                    p = &P_chromaSpread;
-            else if (currentMode == "prismatic")                                  p = &P_echoSpacing;
-            else if (currentMode == "datamosh")                                   p = &P_datamosh;
-            else if (currentMode == "flowripple")                                 p = &P_rippleDecay;
-            else if (currentMode == "turbulence")                                 p = &P_turbShift;
-            else if (currentMode == "ghostecho" || currentMode == "chromaghostecho") p = &P_ghostSpace;
-            else if (currentMode == "timeghost"  || currentMode == "rainbowghost")   p = &P_tghostSpace;
-            else if (currentMode == "tunnelghost" || currentMode == "tunneltimeghost") p = &P_tunnelScale;
-            else if (currentMode == "prismaticghost")                             p = &P_glowBoost;
-            else if (currentMode == "flowwarp")                                   p = &P_flowWarp;
-            else if (currentMode == "wavewarp")                                   p = &P_waveRefract;
-            else if (currentMode == "chromawave")                                 p = &P_chromaWave;
+            if      (currentMode == Mode::MOTION)                                     p = &P_motionDepth;
+            else if (currentMode == Mode::CHROMA)                                     p = &P_chromaOffset;
+            else if (currentMode == Mode::FLOWHUE)                                    p = &P_flowSens;
+            else if (currentMode == Mode::MCHROMA)                                    p = &P_chromaSpread;
+            else if (currentMode == Mode::PRISMATIC)                                  p = &P_echoSpacing;
+            else if (currentMode == Mode::DATAMOSH)                                   p = &P_datamosh;
+            else if (currentMode == Mode::FLOWRIPPLE)                                 p = &P_rippleDecay;
+            else if (currentMode == Mode::TURBULENCE)                                 p = &P_turbShift;
+            else if (currentMode == Mode::GHOSTECHO || currentMode == Mode::CHROMAGHOSTECHO) p = &P_ghostSpace;
+            else if (currentMode == Mode::TIMEGHOST  || currentMode == Mode::RAINBOWGHOST)   p = &P_tghostSpace;
+            else if (currentMode == Mode::TUNNELGHOST || currentMode == Mode::TUNNELTIMEGHOST) p = &P_tunnelScale;
+            else if (currentMode == Mode::PRISMATICGHOST)                             p = &P_glowBoost;
+            else if (currentMode == Mode::FLOWWARP)                                   p = &P_flowWarp;
+            else if (currentMode == Mode::WAVEWARP)                                   p = &P_waveRefract;
+            else if (currentMode == Mode::CHROMAWAVE)                                 p = &P_chromaWave;
             if (p) { p->down(); overlayText = p->display(); }
             else   { updateSpeed.store(max(1, updateSpeed.load() - 1));
                      overlayText = "Speed: " + to_string(updateSpeed.load()); }

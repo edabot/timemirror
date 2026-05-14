@@ -2,9 +2,10 @@
 
 ---
 
-## 2026-05-14 — Centralized parameter config; toggle-pair mode memory; direction mode timing fix
+## 2026-05-14 — Mode enum; centralized parameter config; toggle-pair mode memory; direction mode timing fix
 
 ### Added
+- **`enum class Mode`** — all 24 mode identifiers now live in one enum. `currentMode` and the toggle-pair memory variables (`lastT/Y/G/H/C/K`) are `Mode` values. Typos in mode names are now compile errors instead of silent no-ops. `getModeName()` converted to an exhaustive `switch`. `checkForCombo()` return type changed from `string` to `Mode`.
 - **`ModeParam` struct** — single source of truth for every adjustable parameter: default value, min, max, step size, display label, and format (integer, percent, 1-decimal, 1-decimal+`x` suffix) all live in one `ModeParam` instance per parameter. Previously spread across three locations (global initializer, R-reset handler, Up/Down handlers).
 - **Toggle-pair mode memory** — pressing a toggle key (T/Y/G/H/C/K) from a different mode now restores whichever variant of that pair was last active (`lastT`/`lastY`/`lastG`/`lastH`/`lastC`/`lastK`), rather than always defaulting to the primary variant.
 
