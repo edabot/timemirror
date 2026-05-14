@@ -47,33 +47,59 @@ const int FRAME_WIDTH = 1920;
 const int FRAME_HEIGHT = 1080;
 const int BUFFER_SIZE = 200;
 
+// ── Single source of truth for all adjustable parameters ──────────────────────
+// Each Param holds the live value plus its default, range, step, and display format.
+// R key calls .reset(); Up/Down call .up()/.down(); render loop reads .value or .i().
+enum class ParamFmt { INT, PCT, F1, F1X };
+struct ModeParam {
+    float value;
+    const float def, vmin, vmax, step;
+    const char* const label;
+    const ParamFmt fmt;
+    constexpr ModeParam(float d, float lo, float hi, float s, const char* l,
+                    ParamFmt f = ParamFmt::INT)
+        : value(d), def(d), vmin(lo), vmax(hi), step(s), label(l), fmt(f) {}
+    void reset() { value = def; }
+    void up()    { value = std::min(vmax, value + step); }
+    void down()  { value = std::max(vmin, value - step); }
+    int  i()     const { return (int)value; }
+    std::string display() const {
+        char buf[64];
+        switch (fmt) {
+            case ParamFmt::INT: snprintf(buf,64,"%s: %d",label,(int)value); break;
+            case ParamFmt::PCT: snprintf(buf,64,"%s: %d",label,(int)(value*100+0.5f)); break;
+            case ParamFmt::F1:  snprintf(buf,64,"%s: %.1f",label,value); break;
+            case ParamFmt::F1X: snprintf(buf,64,"%s: %.1fx",label,value); break;
+        }
+        return buf;
+    }
+};
+
+// ── Parameter instances — edit only here to change defaults, ranges, or steps ─
+ModeParam P_chromaOffset {23,    1,    float(BUFFER_SIZE/2-1), 1,    "Chroma"};
+ModeParam P_motionDepth  {40,    5,    float(BUFFER_SIZE-1),   5,    "Depth"};
+ModeParam P_chromaSpread {40,    1,    float(BUFFER_SIZE/2-1), 2,    "Spread"};
+ModeParam P_ghostSpace   {8,     1,    float(BUFFER_SIZE/7),   1,    "Spacing"};
+ModeParam P_flowWarp     {10,    1,    50,    2,    "Warp"};
+ModeParam P_waveRefract  {15,    1,    50,    2,    "Refract"};
+ModeParam P_chromaWave   {2,    1,    15,    1,    "Refract"};
+ModeParam P_echoSpacing  {23,    1,    float(BUFFER_SIZE/3),   2,    "Echo"};
+ModeParam P_flowSens     {10,    2,    50,    2,    "Flow"};
+ModeParam P_datamosh     {0.92f, 0.70f, 0.992f, 0.02f, "Trail",   ParamFmt::PCT};
+ModeParam P_rippleDecay  {0.93f, 0.70f, 0.99f,  0.01f, "Persist", ParamFmt::PCT};
+ModeParam P_turbShift    {20,    2,    60,    2,    "Shift"};
+ModeParam P_tghostSpace  {20,    1,    float(BUFFER_SIZE/7),   1,    "Spacing"};
+ModeParam P_tunnelScale  {3.0f,  1.2f, 8.0f,  0.5f, "Zoom",    ParamFmt::F1X};
+ModeParam P_glowBoost    {0.5f,  0.25f, 6.0f, 0.25f, "Glow",   ParamFmt::F1};
+
 // Motion mode settings
 const int MOTION_LOOKBACK = 10;  // Frames back for motion comparison (higher = reacts to slower motion)
 const int MOTION_BLUR_SIZE = 31; // Spatial blur radius — larger spreads halos further (must be odd)
-
-// Chromatic time shift settings (runtime-adjustable with Up/Down in chroma mode)
-int chromaOffset = 23; // Frames between each colour channel (B=now, G=now-N, R=now-2N)
-
-// Motion adaptive mode settings (runtime-adjustable with Up/Down in motion mode)
-int motionMaxOffset = 40; // Max frames back at full motion (higher = more dreamy, lower = subtle)
-
-// Motion-chromatic mode settings (runtime-adjustable with Up/Down in mchroma mode)
-int chromaSpread = 40; // Max frames between channels at full motion (0-motion = no split)
-
-// Ghost Echo mode (E) — motion-masked stack of 7 temporal echoes.
-// Still areas → black. Moving subjects → layered ghost images from past frames.
-int ghostSpacing = 8; // Frames between each of 7 echoes (Up/Down adjustable)
-
-// Flow Warp mode (V) — optical flow displaces backdrop lookup coordinates.
-// Live camera feed is sampled at (x + vx*scale, y + vy*scale) per pixel, smearing the
-// background in the direction of motion. Person cutout composited on top unwarped.
-float flowWarpScale = 10.0f; // flow amplification (Up/Down adjustable)
 
 // Wave Warp mode (N) — 2D wave simulation seeded by motion.
 // Standard wave equation: new = (neighbors sum)*0.5 - prev, with IIR damping.
 // Wave gradient displaces camera sample coordinates for a refracting water surface.
 Mat waveA, waveB;              // CV_32F double-buffer: waveA=current, waveB=previous
-float waveRefract = 15.0f;     // gradient amplification for refraction (Up/Down adjustable)
 const float WAVE_DAMP = 0.97f; // per-frame damping (lower = shorter ripples)
 const float WAVE_SEED = 3.0f;  // motion map intensity seeded into wave per frame
 
@@ -82,7 +108,6 @@ const float WAVE_SEED = 3.0f;  // motion map intensity seeded into wave per fram
 // independent wave patterns; each channel's displacement is rotated 120° apart so
 // even similar wave shapes produce vivid colour separation in different spatial directions.
 Mat waveAr, waveBr, waveAg, waveBg, waveAb, waveBb; // per-channel double buffers
-float chromaWaveRefract = 30.0f; // gradient amplification per channel (Up/Down adjustable)
 const float CWAVE_DAMP = 0.985f; // less decay than N → bigger sustained waves
 const float CWAVE_SEED = 8.0f;   // stronger injection than N → larger amplitudes
 
@@ -109,67 +134,52 @@ Mat motionMapBuf[2]; // CV_32F
 Mat flowMapBuf[2];   // CV_32FC2
 atomic<int> prepBuf{0};
 
-// Prismatic echo settings (runtime-adjustable with Up/Down in prismatic mode)
-int echoSpacing = 23; // Frames between each of 6 hue-tinted echoes (1 – BUFFER_SIZE/3)
-
 // Optical flow mode working buffers — pre-allocated in main
 // Flow is computed at FLOW_SCALE of full resolution for performance, then resized up.
 const float FLOW_SCALE = 0.25f; // compute flow at 1/4 linear resolution (~16x fewer pixels)
 Mat flowMap;                    // CV_32FC2, shallow-copy alias into flowMapBuf[prepBuf] each frame
-float flowSensitivity = 10.0f;  // flow px/frame (small-scale) that maps to full time offset
 
-// Datamosh mode settings
-// Accumulates per-pixel frame differences with IIR decay.
-// Still areas → black; motion → vivid color trails that persist then fade.
-Mat datamoshAccum;                 // CV_32FC3, signed accumulator
-Mat datamoshDiffF;                 // CV_32FC3 scratch for the per-frame diff
-float datamoshDecay = 0.92f;       // IIR decay per frame (higher = longer trails)
-// Boost scales inversely with (1-decay) to hold steady-state brightness constant:
-// boost = K*(1-decay), K derived from defaults (1.5/0.08 ≈ 18.75).
-// High trail life → low boost, so accum doesn't saturate to white.
+// Datamosh mode buffers
+Mat datamoshAccum;  // CV_32FC3, signed accumulator
+Mat datamoshDiffF;  // CV_32FC3 scratch for the per-frame diff
+// Boost scales inversely with (1-decay) to hold steady-state brightness constant.
 const float DATAMOSH_BOOST_K = 6.5625f;
 
-// Flow Ripple mode (J) — directional color that advects with optical flow and decays over ~1 second.
-// rippleBuffer holds accumulated per-pixel BGR color as float [0–255].
-// Each frame: advect with remap, decay by rippleDecay, inject new color where flow is strong.
-Mat rippleBuffer;          // CV_32FC3, full res, persists between frames
-Mat rippleTmp;             // CV_32FC3, scratch for remap output
-Mat rippleMapX;            // CV_32F,   backward-warp x coords built from flowMap
-Mat rippleMapY;            // CV_32F,   backward-warp y coords built from flowMap
-Mat ripple8;               // CV_8UC3,  converted for additive compositing
-float rippleDecay = 0.93f; // per-frame IIR decay (~1s at 60fps: 0.93^60 ≈ 0.014)
+// Flow Ripple mode buffers
+Mat rippleBuffer; // CV_32FC3, full res, persists between frames
+Mat rippleTmp;    // CV_32FC3, scratch for remap output
+Mat rippleMapX;   // CV_32F,   backward-warp x coords built from flowMap
+Mat rippleMapY;   // CV_32F,   backward-warp y coords built from flowMap
+Mat ripple8;      // CV_8UC3,  converted for additive compositing
 
-// Turbulence mode (T) — per-pixel motion history drives pixel displacement + color separation.
-// turbulenceMap accumulates motion over ~2 seconds via IIR decay.
-// Still areas → near grayscale. Active areas → vivid distortion with chromatic split.
+// Turbulence mode buffers
 Mat turbulenceMap;        // CV_32F, 0–1, accumulated per-pixel motion history
 vector<float> turbNoiseX; // pre-allocated sinf lookup table, size = actualWidth
 vector<float> turbNoiseY; // pre-allocated cosf lookup table, size = actualWidth
 int turbFrame = 0;
-float turbDecay = 0.992f; // IIR decay (~2s half-life at 60fps)
-float turbShift = 20.0f;  // max pixel displacement at full turbulence (Up/Down adjustable)
+const float turbDecay = 0.992f; // IIR decay (~2s half-life at 60fps), not user-adjustable
 
-// Temporal Ghost mode (G) ─────────────────────────────────────────────────────
-// maskBuffer is a circular buffer of CV_8U masks parallel to frameBuffer.
-// segmentLoop() runs on a dedicated thread, feeding frames to the macOS
-// Vision framework (VNGeneratePersonSegmentationRequest) and storing the
-// resulting person masks in maskBuffer at full resolution.
-// segReady tracks the most recently completed mask slot.
+// Temporal Ghost / segmentation state
 vector<Mat> maskBuffer;   // CV_8U, same slots as frameBuffer
 atomic<int> segReady{-1}; // index of last written mask; -1 = not started
-int tghostSpacing = 20;   // frames between each of TGHOST_ECHOES echoes
 const int TGHOST_ECHOES = 7;
-float rainbowHue = 0.0f;         // G/B mode: current base hue (0–360, cycles each frame)
-float rainbowSpeed = 30.0f;      // G/B mode: degrees per second the hue advances
+float rainbowHue  = 0.0f;  // G/T-alt mode: current base hue (0–360, cycles each frame)
+float rainbowSpeed = 30.0f; // degrees per second the hue advances
 const int RAINBOW_HUE_STEP = 45; // degrees between consecutive echoes
-float tunnelScale = 3.0f;        // tunnel ghost modes: scale of oldest echo
-float glowBoost   = 0.5f;        // B mode: glow brightness multiplier (Up/Down adjustable)
-float ringOffset = 0.0f;         // G mode: expanding ring backdrop phase (px, advances each frame)
-const float RING_SPACING = 200.0f; // px between ring centres (period of gray/black alternation)
-const float RING_SPEED   = 75.0f;  // px/s ring expansion speed
+float ringOffset = 0.0f;   // expanding ring backdrop phase (px, advances each frame)
+const float RING_SPACING = 200.0f;
+const float RING_SPEED   = 75.0f;
 
 // Main-thread-only state
 string currentMode = "s";
+// Toggle-pair memory: remembers which variant was last active so returning to a key
+// restores the exact mode the user left, not always the primary variant.
+string lastT = "prismatic";
+string lastY = "flowripple";
+string lastG = "rainbowghost";
+string lastH = "timeghost";
+string lastC = "ghostecho";
+string lastK = "wavewarp";
 map<char, steady_clock::time_point> lastKeyTime;
 const double COMBO_WINDOW = 0.5;
 
@@ -474,7 +484,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
 #pragma omp parallel for schedule(static)
         for (int y = 0; y < height; y++)
         {
-            int frameOffset = (bufIdx - ((height - 1 - y) * BUFFER_SIZE / height) + BUFFER_SIZE) % BUFFER_SIZE;
+            int frameOffset = (bufIdx - 1 - ((height - 1 - y) * BUFFER_SIZE / height) + BUFFER_SIZE * 2) % BUFFER_SIZE;
             frameBuffer[frameOffset].row(y).copyTo(output.row(y));
         }
     }
@@ -483,7 +493,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
 #pragma omp parallel for schedule(static)
         for (int y = 0; y < height; y++)
         {
-            int frameOffset = (bufIdx - (y * BUFFER_SIZE / height) + BUFFER_SIZE) % BUFFER_SIZE;
+            int frameOffset = (bufIdx - 1 - (y * BUFFER_SIZE / height) + BUFFER_SIZE * 2) % BUFFER_SIZE;
             frameBuffer[frameOffset].row(y).copyTo(output.row(y));
         }
     }
@@ -491,7 +501,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
     {
         vector<int> colFrame(width);
         for (int x = 0; x < width; x++)
-            colFrame[x] = (bufIdx - ((width - 1 - x) * BUFFER_SIZE / width) + BUFFER_SIZE) % BUFFER_SIZE;
+            colFrame[x] = (bufIdx - 1 - ((width - 1 - x) * BUFFER_SIZE / width) + BUFFER_SIZE * 2) % BUFFER_SIZE;
         struct Strip { int frame, x0, x1; };
         vector<Strip> strips;
         strips.reserve(BUFFER_SIZE + 2);
@@ -513,7 +523,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
     {
         vector<int> colFrame(width);
         for (int x = 0; x < width; x++)
-            colFrame[x] = (bufIdx - (x * BUFFER_SIZE / width) + BUFFER_SIZE) % BUFFER_SIZE;
+            colFrame[x] = (bufIdx - 1 - (x * BUFFER_SIZE / width) + BUFFER_SIZE * 2) % BUFFER_SIZE;
         struct Strip { int frame, x0, x1; };
         vector<Strip> strips;
         strips.reserve(BUFFER_SIZE + 2);
@@ -544,7 +554,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
             for (int x = 0; x < width; x++)
             {
                 // motion=0 → bufIdx-1 (most recent); motion=1 → bufIdx (oldest)
-                int offset = (int)(motionRow[x] * motionMaxOffset);
+                int offset = (int)(motionRow[x] * P_motionDepth.value);
                 int idx = (bufIdx - 1 - offset + BUFFER_SIZE * 2) % BUFFER_SIZE;
                 outRow[x] = frameBuffer[idx].ptr<Vec3b>(y)[x];
             }
@@ -557,8 +567,8 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
         // objects leave blue→green→red colour trails.
         // mixChannels does this in a single pass with no intermediate allocations.
         int idx0 = (bufIdx - 1 + BUFFER_SIZE * 2) % BUFFER_SIZE;
-        int idx1 = (bufIdx - 1 - chromaOffset + BUFFER_SIZE * 2) % BUFFER_SIZE;
-        int idx2 = (bufIdx - 1 - chromaOffset * 2 + BUFFER_SIZE * 2) % BUFFER_SIZE;
+        int idx1 = (bufIdx - 1 - P_chromaOffset.i() + BUFFER_SIZE * 2) % BUFFER_SIZE;
+        int idx2 = (bufIdx - 1 - P_chromaOffset.i() * 2 + BUFFER_SIZE * 2) % BUFFER_SIZE;
 
         const Mat sources[] = {frameBuffer[idx0], frameBuffer[idx1], frameBuffer[idx2]};
         const int fromTo[] = {0, 0, 4, 1, 8, 2}; // B←frame0, G←frame1, R←frame2
@@ -581,7 +591,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
             const Vec3b *rowB = frameBuffer[idxB].ptr<Vec3b>(y);
             for (int x = 0; x < width; x++)
             {
-                int spread = (int)(motionRow[x] * chromaSpread);
+                int spread = (int)(motionRow[x] * P_chromaSpread.i());
                 int idxG = (bufIdx - 1 - spread + BUFFER_SIZE * 2) % BUFFER_SIZE;
                 int idxR = (bufIdx - 1 - spread * 2 + BUFFER_SIZE * 4) % BUFFER_SIZE;
                 outRow[x][0] = rowB[x][0];                            // B ← newest
@@ -604,7 +614,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
         // Frame indices are independent of y — hoist out of the parallel loop
         int fi[6];
         for (int e = 0; e < 6; e++)
-            fi[e] = (bufIdx - 1 - e * echoSpacing + BUFFER_SIZE * 4) % BUFFER_SIZE;
+            fi[e] = (bufIdx - 1 - e * P_echoSpacing.i() + BUFFER_SIZE * 4) % BUFFER_SIZE;
 #pragma omp parallel for schedule(static)
         for (int y = 0; y < height; y++)
         {
@@ -634,7 +644,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
         // Frame indices are hoisted out of the parallel loop — one per echo.
         int fi[7];
         for (int e = 0; e < 7; e++)
-            fi[e] = (bufIdx - 1 - e * ghostSpacing + BUFFER_SIZE * 10) % BUFFER_SIZE;
+            fi[e] = (bufIdx - 1 - e * P_ghostSpace.i() + BUFFER_SIZE * 10) % BUFFER_SIZE;
         // Triangular weights: e=0 → 7/28, e=1 → 6/28 … e=6 → 1/28
         static const float w[7] = {7 / 28.f, 6 / 28.f, 5 / 28.f, 4 / 28.f, 3 / 28.f, 2 / 28.f, 1 / 28.f};
 #pragma omp parallel for schedule(static)
@@ -672,7 +682,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
         // Per-echo luma × hue replaces the neutral weighted blend; rainbowHue cycles each frame.
         int fi[7];
         for (int e = 0; e < 7; e++)
-            fi[e] = (bufIdx - 1 - e * ghostSpacing + BUFFER_SIZE * 10) % BUFFER_SIZE;
+            fi[e] = (bufIdx - 1 - e * P_ghostSpace.i() + BUFFER_SIZE * 10) % BUFFER_SIZE;
 
         static const float w[7] = {7/28.f, 6/28.f, 5/28.f, 4/28.f, 3/28.f, 2/28.f, 1/28.f};
 
@@ -730,7 +740,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
 
         int fi[TGHOST_ECHOES];
         for (int e = 0; e < TGHOST_ECHOES; e++)
-            fi[e] = (base - e * tghostSpacing + BUFFER_SIZE * 10) % BUFFER_SIZE;
+            fi[e] = (base - e * P_tghostSpace.i() + BUFFER_SIZE * 10) % BUFFER_SIZE;
 
         // Precompute per-echo hue→BGR (cycling like rainbow ghost)
         float eB[TGHOST_ECHOES], eG[TGHOST_ECHOES], eR[TGHOST_ECHOES];
@@ -751,7 +761,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
             }
         }
 
-        float gb      = glowBoost;
+        float gb      = P_glowBoost.value;
         float cx      = (width  - 1) * 0.5f;
         float cy      = (height - 1) * 0.5f;
         float maxDist = sqrtf(cx * cx + cy * cy); // corner distance for brightness ramp
@@ -814,7 +824,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
         }
         int fi[TGHOST_ECHOES];
         for (int e = 0; e < TGHOST_ECHOES; e++)
-            fi[e] = (base - e * tghostSpacing + BUFFER_SIZE * 10) % BUFFER_SIZE;
+            fi[e] = (base - e * P_tghostSpace.i() + BUFFER_SIZE * 10) % BUFFER_SIZE;
 
         // Precompute per-echo fade (depends only on echo index, not on pixel)
         float echoFade[TGHOST_ECHOES];
@@ -869,7 +879,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
 
         int fi[TGHOST_ECHOES];
         for (int e = 0; e < TGHOST_ECHOES; e++)
-            fi[e] = (base - e * tghostSpacing + BUFFER_SIZE * 10) % BUFFER_SIZE;
+            fi[e] = (base - e * P_tghostSpace.i() + BUFFER_SIZE * 10) % BUFFER_SIZE;
 
         // Precompute hue→BGR for each echo (no fade — all echoes at full brightness)
         float eB[TGHOST_ECHOES], eG[TGHOST_ECHOES], eR[TGHOST_ECHOES];
@@ -965,7 +975,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
 
         int fi[TGHOST_ECHOES];
         for (int e = 0; e < TGHOST_ECHOES; e++)
-            fi[e] = (base - e * tghostSpacing + BUFFER_SIZE * 10) % BUFFER_SIZE;
+            fi[e] = (base - e * P_tghostSpace.i() + BUFFER_SIZE * 10) % BUFFER_SIZE;
 
         float echoFade[TGHOST_ECHOES];
         for (int e = 0; e < TGHOST_ECHOES; e++)
@@ -974,7 +984,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
         float inv_s[TGHOST_ECHOES];
         for (int e = 0; e < TGHOST_ECHOES; e++)
         {
-            float s = 1.0f + (tunnelScale - 1.0f) * (float)e / (TGHOST_ECHOES - 1);
+            float s = 1.0f + (P_tunnelScale.value - 1.0f) * (float)e / (TGHOST_ECHOES - 1);
             inv_s[e] = 1.0f / s;
         }
 
@@ -1030,14 +1040,14 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
     {
         // Rainbow Ghost variant where each older echo is scaled down toward the image centre,
         // creating a receding tunnel of coloured person silhouettes.
-        // Newest echo (e=0) = full size; oldest (e=TGHOST_ECHOES-1) = tunnelScale × full size.
+        // Newest echo (e=0) = full size; oldest (e=TGHOST_ECHOES-1) = P_tunnelScale.value × full size.
         // Rendered back-to-front so the nearest (largest) echo paints last.
         int base = segReady.load(memory_order_acquire);
         if (base < 0) { output.setTo(Scalar(0, 0, 0)); return; }
 
         int fi[TGHOST_ECHOES];
         for (int e = 0; e < TGHOST_ECHOES; e++)
-            fi[e] = (base - e * tghostSpacing + BUFFER_SIZE * 10) % BUFFER_SIZE;
+            fi[e] = (base - e * P_tghostSpace.i() + BUFFER_SIZE * 10) % BUFFER_SIZE;
 
         // Same hue palette as Rainbow Ghost
         float eB[TGHOST_ECHOES], eG[TGHOST_ECHOES], eR[TGHOST_ECHOES];
@@ -1058,12 +1068,12 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
             }
         }
 
-        // Per-echo display scale: newest (e=0)=1.0 (full frame), oldest=tunnelScale (>1 = zoomed in)
+        // Per-echo display scale: newest (e=0)=1.0 (full frame), oldest=P_tunnelScale.value (>1 = zoomed in)
         // inv_s < 1 for older echoes: samples a smaller centre crop → person appears larger than frame
         float inv_s[TGHOST_ECHOES]; // precompute 1/scale to avoid division in the pixel loop
         for (int e = 0; e < TGHOST_ECHOES; e++)
         {
-            float s = 1.0f + (tunnelScale - 1.0f) * (float)e / (TGHOST_ECHOES - 1);
+            float s = 1.0f + (P_tunnelScale.value - 1.0f) * (float)e / (TGHOST_ECHOES - 1);
             inv_s[e] = 1.0f / s;
         }
 
@@ -1125,7 +1135,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
         // Person cutout (Vision mask) composited on top unwarped.
         int recent = (bufIdx - 1 + BUFFER_SIZE * 2) % BUFFER_SIZE;
         bool hasFlow = !flowMap.empty() && flowMap.rows == height && flowMap.cols == width;
-        float ws  = flowWarpScale;
+        float ws  = P_flowWarp.value;
         int sr = segReady.load(memory_order_acquire);
 #pragma omp parallel for schedule(static)
         for (int y = 0; y < height; y++)
@@ -1172,7 +1182,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
         // Motion map seeds new energy; wave gradient displaces camera sample per pixel.
         int recent = (bufIdx - 1 + BUFFER_SIZE * 2) % BUFFER_SIZE;
         bool hasMotion = !motionMap.empty() && motionMap.rows == height && motionMap.cols == width;
-        float refract = waveRefract;
+        float refract = P_waveRefract.value;
 
         // Propagate wave: read waveA (current), update waveB (previous) in-place, seed motion
 #pragma omp parallel for schedule(static)
@@ -1225,7 +1235,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
         // their own wave's gradient — different-coloured motion creates independent ripple patterns.
         int recent  = (bufIdx - 1 + BUFFER_SIZE * 2) % BUFFER_SIZE;
         int prev_f  = (bufIdx - 1 - MOTION_LOOKBACK + BUFFER_SIZE * 4) % BUFFER_SIZE;
-        float refract = chromaWaveRefract;
+        float refract = P_chromaWave.value;
 
         // Propagate all three waves in one OMP pass; seed each from its own colour diff
 #pragma omp parallel for schedule(static)
@@ -1300,7 +1310,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
     {
         // turbulenceMap is maintained by the preprocessing block.
         // Per-pixel: turbulence level (0=still, 1=max) drives:
-        //   • animated sine-wave displacement (scaled by turbShift)
+        //   • animated sine-wave displacement (scaled by P_turbShift.value)
         //   • chromatic split: B/G/R sampled from different x offsets
         //   • saturation: 0 turbulence → grayscale, full → 2.5× vivid
         // xNoiseX/Y are precomputed per frame to avoid trig in the inner loop.
@@ -1330,8 +1340,8 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
                 }
                 float nx = (turbNoiseX[x] + rowNX) * 0.5f;
                 float ny = (turbNoiseY[x] + rowNY) * 0.5f;
-                int dx = (int)(nx * t * turbShift);
-                int dy = (int)(ny * t * turbShift);
+                int dx = (int)(nx * t * P_turbShift.value);
+                int dy = (int)(ny * t * P_turbShift.value);
                 // Each channel displaced in a different direction for vivid separation.
                 // B: push opposite to main displacement; R: amplified main direction;
                 // G: perpendicular. Spread scales with turbulence (max ~50px per channel).
@@ -1373,7 +1383,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
                 float vx = flowRow[x][0];
                 float vy = flowRow[x][1];
                 float mag = sqrtf(vx * vx + vy * vy);
-                float sat = min(mag / flowSensitivity, 1.0f);
+                float sat = min(mag / P_flowSens.value, 1.0f);
                 Vec3b pix = srcRow[x];
                 float val = (pix[0] * 0.114f + pix[1] * 0.587f + pix[2] * 0.299f) * (1.0f / 255.0f);
                 float hue = (atan2f(vy, vx) + 3.14159265f) / PI2 * 360.0f;
@@ -1669,7 +1679,7 @@ int main()
         {
             int curr = (bufIdx - 1 + BUFFER_SIZE * 2) % BUFFER_SIZE;
             int prev = (bufIdx - 1 - MOTION_LOOKBACK + BUFFER_SIZE * 2) % BUFFER_SIZE;
-            float datamoshBoost = DATAMOSH_BOOST_K * (1.0f - datamoshDecay);
+            float datamoshBoost = DATAMOSH_BOOST_K * (1.0f - P_datamosh.value);
             // Fuse absdiff + convertTo + addWeighted + convertTo(output) into one pass.
             // Eliminates datamoshDiffF scratch buffer and 3 extra full-frame traversals.
 #pragma omp parallel for schedule(static)
@@ -1685,7 +1695,7 @@ int main()
                     float diff = (float)(currRow[i] > prevRow[i]
                                          ? currRow[i] - prevRow[i]
                                          : prevRow[i] - currRow[i]);
-                    float val = accumRow[i] * datamoshDecay + diff * datamoshBoost;
+                    float val = accumRow[i] * P_datamosh.value + diff * datamoshBoost;
                     accumRow[i] = val;
                     outRow[i]   = val < 255.0f ? (uchar)val : 255;
                 }
@@ -1725,12 +1735,12 @@ int main()
         // Update flow ripple buffer — advect, decay, inject — used by flowripple mode.
         // 1. Build per-pixel backward-warp maps from flowMap.
         // 2. remap advects existing color content forward (in the flow direction).
-        // 3. Decay: multiply by rippleDecay (~1 second lifetime at 60fps).
+        // 3. Decay: multiply by P_rippleDecay.value (~1 second lifetime at 60fps).
         // 4. Inject: where flow is strong, add a fresh saturated directional color additively.
         if (currentMode == "flowripple")
         {
             const float PI2 = 2.0f * 3.14159265f;
-            const float invSens = 1.0f / flowSensitivity;
+            const float invSens = 1.0f / P_flowSens.value;
             const float invPI2 = 360.0f / PI2;
 
 // Step 1: build backward-warp maps (pixel at (x,y) came from (x-vx, y-vy))
@@ -1752,7 +1762,7 @@ int main()
                   INTER_LINEAR, BORDER_CONSTANT, Scalar(0, 0, 0));
 
             // Step 3: decay
-            rippleTmp *= rippleDecay;
+            rippleTmp *= P_rippleDecay.value;
 
 // Step 4: inject fresh directional color where motion exceeds threshold
 #pragma omp parallel for schedule(static)
@@ -1885,21 +1895,21 @@ int main()
         }
         else if (key == 't')
         {
-            if (currentMode == "prismatic")
-                currentMode = "prismaticghost";
+            if (currentMode == "prismatic" || currentMode == "prismaticghost")
+                currentMode = (currentMode == "prismatic") ? "prismaticghost" : "prismatic";
             else
-                currentMode = "prismatic";
+                currentMode = lastT;
+            lastT = currentMode;
             cout << "Mode: " << getModeName() << endl;
         }
         else if (key == 'y')
         {
-            if (currentMode == "flowripple")
-                currentMode = "flowhue";
+            if (currentMode == "flowripple" || currentMode == "flowhue")
+                currentMode = (currentMode == "flowripple") ? "flowhue" : "flowripple";
             else
-            {
-                currentMode = "flowripple";
-                rippleBuffer.setTo(0); // clear lingering state on entry
-            }
+                currentMode = lastY;
+            lastY = currentMode;
+            if (currentMode == "flowripple") rippleBuffer.setTo(0);
             cout << "Mode: " << getModeName() << endl;
         }
         else if (key == 'i')
@@ -1917,26 +1927,29 @@ int main()
         }
         else if (key == 'c')
         {
-            if (currentMode == "ghostecho")
-                currentMode = "chromaghostecho";
+            if (currentMode == "ghostecho" || currentMode == "chromaghostecho")
+                currentMode = (currentMode == "ghostecho") ? "chromaghostecho" : "ghostecho";
             else
-                currentMode = "ghostecho";
+                currentMode = lastC;
+            lastC = currentMode;
             cout << "Mode: " << getModeName() << endl;
         }
         else if (key == 'h')
         {
-            if (currentMode == "timeghost")
-                currentMode = "tunneltimeghost";
+            if (currentMode == "timeghost" || currentMode == "tunneltimeghost")
+                currentMode = (currentMode == "timeghost") ? "tunneltimeghost" : "timeghost";
             else
-                currentMode = "timeghost";
+                currentMode = lastH;
+            lastH = currentMode;
             cout << "Mode: " << getModeName() << endl;
         }
         else if (key == 'g')
         {
-            if (currentMode == "rainbowghost")
-                currentMode = "tunnelghost";
+            if (currentMode == "rainbowghost" || currentMode == "tunnelghost")
+                currentMode = (currentMode == "rainbowghost") ? "tunnelghost" : "rainbowghost";
             else
-                currentMode = "rainbowghost";
+                currentMode = lastG;
+            lastG = currentMode;
             cout << "Mode: " << getModeName() << endl;
         }
         else if (key == 'v')
@@ -1946,16 +1959,16 @@ int main()
         }
         else if (key == 'k')
         {
-            if (currentMode == "wavewarp")
-            {
-                currentMode = "chromawave";
+            if (currentMode == "wavewarp" || currentMode == "chromawave")
+                currentMode = (currentMode == "wavewarp") ? "chromawave" : "wavewarp";
+            else
+                currentMode = lastK;
+            lastK = currentMode;
+            if (currentMode == "chromawave") {
                 waveAr.setTo(0); waveBr.setTo(0);
                 waveAg.setTo(0); waveBg.setTo(0);
                 waveAb.setTo(0); waveBb.setTo(0);
-            }
-            else
-            {
-                currentMode = "wavewarp";
+            } else {
                 waveA.setTo(0); waveB.setTo(0);
             }
             cout << "Mode: " << getModeName() << endl;
@@ -1969,273 +1982,75 @@ int main()
         }
         else if (key == 'r')
         {
-            if (currentMode == "motion")
-            {
-                motionMaxOffset = 40;
-                overlayText = "Depth: " + to_string(motionMaxOffset);
-            }
-            else if (currentMode == "chroma")
-            {
-                chromaOffset = 23;
-                overlayText = "Chroma: " + to_string(chromaOffset);
-            }
-            else if (currentMode == "flowhue")
-            {
-                flowSensitivity = 10.0f;
-                overlayText = "Flow: " + to_string((int)flowSensitivity);
-            }
-            else if (currentMode == "mchroma")
-            {
-                chromaSpread = 40;
-                overlayText = "Spread: " + to_string(chromaSpread);
-            }
-            else if (currentMode == "prismatic")
-            {
-                echoSpacing = 23;
-                overlayText = "Echo: " + to_string(echoSpacing);
-            }
-            else if (currentMode == "datamosh")
-            {
-                datamoshDecay = 0.92f;
-                overlayText = "Trail: " + to_string((int)(datamoshDecay * 100));
-            }
-            else if (currentMode == "flowripple")
-            {
-                rippleDecay = 0.93f;
-                overlayText = "Persist: " + to_string((int)(rippleDecay * 100));
-            }
-            else if (currentMode == "turbulence")
-            {
-                turbShift = 20.0f;
-                overlayText = "Shift: " + to_string((int)turbShift);
-            }
-            else if (currentMode == "ghostecho" || currentMode == "chromaghostecho")
-            {
-                ghostSpacing = 8;
-                overlayText = "Spacing: " + to_string(ghostSpacing);
-            }
-            else if (currentMode == "timeghost")
-            {
-                tghostSpacing = 20;
-                overlayText = "Spacing: " + to_string(tghostSpacing);
-            }
-            else if (currentMode == "rainbowghost")
-            {
-                tghostSpacing = 20;
-                overlayText = "Spacing: " + to_string(tghostSpacing);
-            }
-            else if (currentMode == "tunnelghost" || currentMode == "tunneltimeghost")
-            {
-                tunnelScale = 3.0f;
-                overlayText = "Zoom: " + to_string(tunnelScale).substr(0, 3) + "x";
-            }
-            else if (currentMode == "prismaticghost")
-            {
-                glowBoost = 0.5f;
-                overlayText = "Glow: " + to_string(glowBoost).substr(0, 3);
-            }
-            else if (currentMode == "flowwarp")
-            {
-                flowWarpScale = 10.0f;
-                overlayText = "Warp: " + to_string((int)flowWarpScale);
-            }
-            else if (currentMode == "wavewarp")
-            {
-                waveRefract = 15.0f;
-                overlayText = "Refract: " + to_string((int)waveRefract);
-            }
-            else if (currentMode == "chromawave")
-            {
-                chromaWaveRefract = 30.0f;
-                overlayText = "Refract: " + to_string((int)chromaWaveRefract);
-            }
-            else
-            {
-                updateSpeed.store(1);
-                overlayText = "Speed: 1";
-            }
+            // Returns the Param to reset for the current mode, or nullptr for speed reset.
+            ModeParam* p = nullptr;
+            if      (currentMode == "motion")                                     p = &P_motionDepth;
+            else if (currentMode == "chroma")                                     p = &P_chromaOffset;
+            else if (currentMode == "flowhue")                                    p = &P_flowSens;
+            else if (currentMode == "mchroma")                                    p = &P_chromaSpread;
+            else if (currentMode == "prismatic")                                  p = &P_echoSpacing;
+            else if (currentMode == "datamosh")                                   p = &P_datamosh;
+            else if (currentMode == "flowripple")                                 p = &P_rippleDecay;
+            else if (currentMode == "turbulence")                                 p = &P_turbShift;
+            else if (currentMode == "ghostecho" || currentMode == "chromaghostecho") p = &P_ghostSpace;
+            else if (currentMode == "timeghost"  || currentMode == "rainbowghost")   p = &P_tghostSpace;
+            else if (currentMode == "tunnelghost" || currentMode == "tunneltimeghost") p = &P_tunnelScale;
+            else if (currentMode == "prismaticghost")                             p = &P_glowBoost;
+            else if (currentMode == "flowwarp")                                   p = &P_flowWarp;
+            else if (currentMode == "wavewarp")                                   p = &P_waveRefract;
+            else if (currentMode == "chromawave")                                 p = &P_chromaWave;
+            if (p) { p->reset(); overlayText = p->display(); }
+            else   { updateSpeed.store(1); overlayText = "Speed: 1"; }
             cout << overlayText << endl;
             lastOverlayTime = steady_clock::now();
             overlayActive = true;
         }
         else if (key == 0)
         { // Up arrow (Mac)
-            if (currentMode == "motion")
-            {
-                motionMaxOffset = min(BUFFER_SIZE - 1, motionMaxOffset + 5);
-                overlayText = "Depth: " + to_string(motionMaxOffset);
-            }
-            else if (currentMode == "chroma")
-            {
-                chromaOffset = min(BUFFER_SIZE / 2 - 1, chromaOffset + 1);
-                overlayText = "Chroma: " + to_string(chromaOffset);
-            }
-            else if (currentMode == "flowhue")
-            {
-                flowSensitivity = min(50.0f, flowSensitivity + 2.0f);
-                overlayText = "Flow: " + to_string((int)flowSensitivity);
-            }
-            else if (currentMode == "mchroma")
-            {
-                chromaSpread = min(BUFFER_SIZE / 2 - 1, chromaSpread + 2);
-                overlayText = "Spread: " + to_string(chromaSpread);
-            }
-            else if (currentMode == "prismatic")
-            {
-                echoSpacing = min(BUFFER_SIZE / 3, echoSpacing + 2);
-                overlayText = "Echo: " + to_string(echoSpacing);
-            }
-            else if (currentMode == "datamosh")
-            {
-                datamoshDecay = min(0.992f, datamoshDecay + 0.02f); // 0.992 ≈ 1.5s half-life at 60fps
-                overlayText = "Trail: " + to_string((int)(datamoshDecay * 100));
-            }
-            else if (currentMode == "flowripple")
-            {
-                rippleDecay = min(0.99f, rippleDecay + 0.01f);
-                overlayText = "Persist: " + to_string((int)(rippleDecay * 100));
-            }
-            else if (currentMode == "turbulence")
-            {
-                turbShift = min(60.0f, turbShift + 2.0f);
-                overlayText = "Shift: " + to_string((int)turbShift);
-            }
-            else if (currentMode == "ghostecho" || currentMode == "chromaghostecho")
-            {
-                ghostSpacing = min(BUFFER_SIZE / 7, ghostSpacing + 1);
-                overlayText = "Spacing: " + to_string(ghostSpacing);
-            }
-            else if (currentMode == "timeghost")
-            {
-                tghostSpacing = min(BUFFER_SIZE / TGHOST_ECHOES, tghostSpacing + 1);
-                overlayText = "Spacing: " + to_string(tghostSpacing);
-            }
-            else if (currentMode == "rainbowghost")
-            {
-                tghostSpacing = min(BUFFER_SIZE / TGHOST_ECHOES, tghostSpacing + 1);
-                overlayText = "Spacing: " + to_string(tghostSpacing);
-            }
-            else if (currentMode == "tunnelghost" || currentMode == "tunneltimeghost")
-            {
-                tunnelScale = min(8.0f, tunnelScale + 0.5f);
-                overlayText = "Zoom: " + to_string(tunnelScale).substr(0, 3) + "x";
-            }
-            else if (currentMode == "prismaticghost")
-            {
-                glowBoost = min(6.0f, glowBoost + 0.25f);
-                overlayText = "Glow: " + to_string(glowBoost).substr(0, 3);
-            }
-            else if (currentMode == "flowwarp")
-            {
-                flowWarpScale = min(50.0f, flowWarpScale + 2.0f);
-                overlayText = "Warp: " + to_string((int)flowWarpScale);
-            }
-            else if (currentMode == "wavewarp")
-            {
-                waveRefract = min(50.0f, waveRefract + 2.0f);
-                overlayText = "Refract: " + to_string((int)waveRefract);
-            }
-            else if (currentMode == "chromawave")
-            {
-                chromaWaveRefract = min(50.0f, chromaWaveRefract + 2.0f);
-                overlayText = "Refract: " + to_string((int)chromaWaveRefract);
-            }
-            else
-            {
-                updateSpeed.store(min(BUFFER_SIZE, updateSpeed.load() + 1));
-                overlayText = "Speed: " + to_string(updateSpeed.load());
-            }
+            ModeParam* p = nullptr;
+            if      (currentMode == "motion")                                     p = &P_motionDepth;
+            else if (currentMode == "chroma")                                     p = &P_chromaOffset;
+            else if (currentMode == "flowhue")                                    p = &P_flowSens;
+            else if (currentMode == "mchroma")                                    p = &P_chromaSpread;
+            else if (currentMode == "prismatic")                                  p = &P_echoSpacing;
+            else if (currentMode == "datamosh")                                   p = &P_datamosh;
+            else if (currentMode == "flowripple")                                 p = &P_rippleDecay;
+            else if (currentMode == "turbulence")                                 p = &P_turbShift;
+            else if (currentMode == "ghostecho" || currentMode == "chromaghostecho") p = &P_ghostSpace;
+            else if (currentMode == "timeghost"  || currentMode == "rainbowghost")   p = &P_tghostSpace;
+            else if (currentMode == "tunnelghost" || currentMode == "tunneltimeghost") p = &P_tunnelScale;
+            else if (currentMode == "prismaticghost")                             p = &P_glowBoost;
+            else if (currentMode == "flowwarp")                                   p = &P_flowWarp;
+            else if (currentMode == "wavewarp")                                   p = &P_waveRefract;
+            else if (currentMode == "chromawave")                                 p = &P_chromaWave;
+            if (p) { p->up(); overlayText = p->display(); }
+            else   { updateSpeed.store(min(BUFFER_SIZE, updateSpeed.load() + 1));
+                     overlayText = "Speed: " + to_string(updateSpeed.load()); }
             cout << overlayText << endl;
             lastOverlayTime = steady_clock::now();
             overlayActive = true;
         }
         else if (key == 1)
         { // Down arrow (Mac)
-            if (currentMode == "motion")
-            {
-                motionMaxOffset = max(5, motionMaxOffset - 5);
-                overlayText = "Depth: " + to_string(motionMaxOffset);
-            }
-            else if (currentMode == "chroma")
-            {
-                chromaOffset = max(1, chromaOffset - 1);
-                overlayText = "Chroma: " + to_string(chromaOffset);
-            }
-            else if (currentMode == "flowhue")
-            {
-                flowSensitivity = max(2.0f, flowSensitivity - 2.0f);
-                overlayText = "Flow: " + to_string((int)flowSensitivity);
-            }
-            else if (currentMode == "mchroma")
-            {
-                chromaSpread = max(1, chromaSpread - 2);
-                overlayText = "Spread: " + to_string(chromaSpread);
-            }
-            else if (currentMode == "prismatic")
-            {
-                echoSpacing = max(1, echoSpacing - 2);
-                overlayText = "Echo: " + to_string(echoSpacing);
-            }
-            else if (currentMode == "datamosh")
-            {
-                datamoshDecay = max(0.70f, datamoshDecay - 0.02f);
-                overlayText = "Trail: " + to_string((int)(datamoshDecay * 100));
-            }
-            else if (currentMode == "flowripple")
-            {
-                rippleDecay = max(0.70f, rippleDecay - 0.01f);
-                overlayText = "Persist: " + to_string((int)(rippleDecay * 100));
-            }
-            else if (currentMode == "turbulence")
-            {
-                turbShift = max(2.0f, turbShift - 2.0f);
-                overlayText = "Shift: " + to_string((int)turbShift);
-            }
-            else if (currentMode == "ghostecho" || currentMode == "chromaghostecho")
-            {
-                ghostSpacing = max(1, ghostSpacing - 1);
-                overlayText = "Spacing: " + to_string(ghostSpacing);
-            }
-            else if (currentMode == "timeghost")
-            {
-                tghostSpacing = max(1, tghostSpacing - 1);
-                overlayText = "Spacing: " + to_string(tghostSpacing);
-            }
-            else if (currentMode == "rainbowghost")
-            {
-                tghostSpacing = max(1, tghostSpacing - 1);
-                overlayText = "Spacing: " + to_string(tghostSpacing);
-            }
-            else if (currentMode == "tunnelghost" || currentMode == "tunneltimeghost")
-            {
-                tunnelScale = max(1.2f, tunnelScale - 0.5f);
-                overlayText = "Zoom: " + to_string(tunnelScale).substr(0, 3) + "x";
-            }
-            else if (currentMode == "prismaticghost")
-            {
-                glowBoost = max(0.25f, glowBoost - 0.25f);
-                overlayText = "Glow: " + to_string(glowBoost).substr(0, 3);
-            }
-            else if (currentMode == "flowwarp")
-            {
-                flowWarpScale = max(1.0f, flowWarpScale - 2.0f);
-                overlayText = "Warp: " + to_string((int)flowWarpScale);
-            }
-            else if (currentMode == "wavewarp")
-            {
-                waveRefract = max(1.0f, waveRefract - 2.0f);
-                overlayText = "Refract: " + to_string((int)waveRefract);
-            }
-            else if (currentMode == "chromawave")
-            {
-                chromaWaveRefract = max(1.0f, chromaWaveRefract - 2.0f);
-                overlayText = "Refract: " + to_string((int)chromaWaveRefract);
-            }
-            else
-            {
-                updateSpeed.store(max(1, updateSpeed.load() - 1));
-                overlayText = "Speed: " + to_string(updateSpeed.load());
-            }
+            ModeParam* p = nullptr;
+            if      (currentMode == "motion")                                     p = &P_motionDepth;
+            else if (currentMode == "chroma")                                     p = &P_chromaOffset;
+            else if (currentMode == "flowhue")                                    p = &P_flowSens;
+            else if (currentMode == "mchroma")                                    p = &P_chromaSpread;
+            else if (currentMode == "prismatic")                                  p = &P_echoSpacing;
+            else if (currentMode == "datamosh")                                   p = &P_datamosh;
+            else if (currentMode == "flowripple")                                 p = &P_rippleDecay;
+            else if (currentMode == "turbulence")                                 p = &P_turbShift;
+            else if (currentMode == "ghostecho" || currentMode == "chromaghostecho") p = &P_ghostSpace;
+            else if (currentMode == "timeghost"  || currentMode == "rainbowghost")   p = &P_tghostSpace;
+            else if (currentMode == "tunnelghost" || currentMode == "tunneltimeghost") p = &P_tunnelScale;
+            else if (currentMode == "prismaticghost")                             p = &P_glowBoost;
+            else if (currentMode == "flowwarp")                                   p = &P_flowWarp;
+            else if (currentMode == "wavewarp")                                   p = &P_waveRefract;
+            else if (currentMode == "chromawave")                                 p = &P_chromaWave;
+            if (p) { p->down(); overlayText = p->display(); }
+            else   { updateSpeed.store(max(1, updateSpeed.load() - 1));
+                     overlayText = "Speed: " + to_string(updateSpeed.load()); }
             cout << overlayText << endl;
             lastOverlayTime = steady_clock::now();
             overlayActive = true;

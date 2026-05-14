@@ -2,6 +2,20 @@
 
 ---
 
+## 2026-05-14 — Centralized parameter config; toggle-pair mode memory; direction mode timing fix
+
+### Added
+- **`ModeParam` struct** — single source of truth for every adjustable parameter: default value, min, max, step size, display label, and format (integer, percent, 1-decimal, 1-decimal+`x` suffix) all live in one `ModeParam` instance per parameter. Previously spread across three locations (global initializer, R-reset handler, Up/Down handlers).
+- **Toggle-pair mode memory** — pressing a toggle key (T/Y/G/H/C/K) from a different mode now restores whichever variant of that pair was last active (`lastT`/`lastY`/`lastG`/`lastH`/`lastC`/`lastK`), rather than always defaulting to the primary variant.
+
+### Fixed
+- **Direction modes newest-frame edge** — S/W/A/D used `bufIdx` (next-write slot = oldest frame) as the base for their frame-index formula, so the "newest" edge of each mode was actually one buffer-cycle stale. Fixed to `bufIdx − 1` (most recent frame), matching the already-correct WS/AD combo modes.
+
+### Changed
+- **R/Up/Down key handlers refactored** — each of the three handlers is now a single mode→`ModeParam*` dispatch table followed by one `p->reset()` / `p->up()` / `p->down()` call. Eliminated ~200 lines of triplicated if/else chains.
+
+---
+
 ## 2026-05-12 — Toggle-pair mode system; Prismatic Ghost; Chroma Ghost Echo; Tunnel Time Ghost; Chroma Wave tuning
 
 ### Added

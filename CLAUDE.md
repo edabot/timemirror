@@ -77,13 +77,13 @@ This project captures live webcam footage and applies a time-displacement effect
 
 **Motion Chromatic Mode (J):**
 - Per-frame: `absdiff` between current and `MOTION_LOOKBACK` frames ago → Gaussian blur → CV_32F motionMap (0–1)
-- Per-pixel: motion value scales a `chromaSpread` offset (default 20 frames)
+- Per-pixel: motion value scales a `P_chromaSpread` offset (default 40 frames)
 - Blue channel pulled from `idx - spread`, Green from `idx`, Red from `idx + spread`
 - Still pixels: all three channels from same frame → no color shift
-- Moving pixels: full `chromaSpread` offset → vivid RGB split
+- Moving pixels: full `P_chromaSpread` offset → vivid RGB split
 
 **Prismatic Echo Mode (T):**
-- 6 temporal echoes, spaced `echoSpacing` frames apart (default 15)
+- 6 temporal echoes, spaced `P_echoSpacing` frames apart (default 23)
 - Each echo is tinted with a spectral color: Red → Yellow → Green → Cyan → Blue → Magenta
 - Output averages 3 echoes per channel, so still images reproduce faithfully with no color cast
 - Moving subjects: echoes separate in time → rainbow trails follow motion
@@ -265,13 +265,18 @@ atomic<int>  updateSpeed;         // Lines advanced per captured frame
 atomic<bool> running;             // Shared stop signal for capture thread
 string       currentMode;         // Current direction mode (main thread only)
 
-// Special mode parameters
-int chromaSpread = 20;            // X mode: max frame spread at full motion
-int echoSpacing  = 15;            // P mode: frames between each of 6 echoes
-float flowSensitivity = 10.0f;   // H mode: flow magnitude scaling
+// All adjustable parameters — single source of truth (lines 79–93 in time_mirror.mm)
+ModeParam P_echoSpacing  {23, 1, 66,   2, "Echo"};   // prismatic
+ModeParam P_flowSens     {10, 2, 50,   2, "Flow"};   // flowhue
+ModeParam P_ghostSpace   { 8, 1, 28,   1, "Spacing"};// ghostecho / chromaghostecho
+ModeParam P_tghostSpace  {20, 1, 28,   1, "Spacing"};// timeghost / rainbowghost
+// ... (15 params total; edit only the ModeParam table to change defaults, ranges, or steps)
 
-// Optical flow buffers (H mode)
-Mat flowMap, smallFlowBuf, smallPrevBGR, smallCurrBGR, prevGraySmall, currGraySmall;
+// Toggle-pair mode memory (restored when re-entering a key's pair from elsewhere)
+string lastT, lastY, lastG, lastH, lastC, lastK;
+
+// Optical flow buffers
+Mat flowMap; // CV_32FC2, full-res alias into prepBuf double-buffer
 
 // Key functions
 void captureLoop(VideoCapture&)   // Capture thread: grab, flip, write to buffer
