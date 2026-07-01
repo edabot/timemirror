@@ -2,6 +2,29 @@
 
 ---
 
+## 2026-06-29 — Masked Ghost modes (Y); key swap B↔Y; color modifiers; settings menu; bundle trimming
+
+### Added
+- **Y: Masked Ghost** — 5 Vision person masks boolean-OR'd into a union silhouette; 10 echoes of the person additively accumulated within that mask; ring backdrop. Up/Down adjusts mask echo spacing (`tghostSpace`). Image echo spacing set via settings menu (`ghostSpace`).
+- **Y: Chroma Masked Ghost (Y alt)** — Same union mask, but each image echo replaced by luma × cycling spectral hue (same `rainbowHue` cycling as G/T-alt). Press Y again to toggle between natural-colour and chroma variants.
+- **Color modifier combos** — Direction key + effect key within 0.5 s applies a color grade to the active direction mode: T→Psych Cycle, Y→Vaporwave, U→False Poster, I→Cel Shade, G→Neon, H→Thermal, J→False 2, K→Infrared.
+- **Vaporwave color mod** — 8-stop alternating bright/dark palette (ff61c6/5cecff/f4ff61/ff9900/375971/0a0c37) with smoothstep interpolation; phase cycles at 0.25× speed via `colorModPhase`; wrap at 8π prevents visible jump.
+- **Psych Cycle color mod** — animated psychedelic sine-wave palette (replaces static Saturated).
+- **False 2 / Infrared color mods** — additional false-color palettes on J and K combos.
+- **Settings menu (`;`)** — runtime editor for all 15 mode parameters (value, default, min, max, step). Arrow keys navigate rows/columns; +/- adjust; S saves to `settings.cfg`. Auto-saved on quit, auto-loaded on startup.
+- **`settings.cfg` persistence** — plain-text format `timemirror_settings_v1` + one line per param. Version header guards against loading incompatible files.
+
+### Changed
+- **Key swap B ↔ Y** — Y now hosts Masked Ghost / Chroma Masked Ghost; B now hosts Flow Color Ripple / Flow Direction Color. Y+direction combo (Vaporwave) is unaffected.
+- **Fullscreen on startup** — app enters fullscreen immediately on launch.
+- **Makefile `dist` / `app` targets** — post-dylibbundler step replaces `opencv_dnn` and `opencv_calib3d` with empty stubs, redirects `openblas` references to macOS Accelerate framework, removes `libopenvino`, `libprotobuf`, `libgfortran`, `libopencv_features2d`, `libopencv_flann`. App bundle size: ~115 MB → ~60 MB.
+
+### Fixed
+- **`settings.cfg` version mismatch** — previous save used a different parameter ordering; all values were loaded into wrong params (datamosh got 10, chromaSpread got 0.5, waveRefract got 0.93). Reset file to code defaults.
+- **Y1 Masked Ghost solid white** — additive accumulation of 10 echoes overflowed with `×2.0` brightness boost; removed the boost (normalization by `invWsum` already gives natural brightness).
+
+---
+
 ## 2026-05-14 — Mode enum; centralized parameter config; toggle-pair mode memory; direction mode timing fix
 
 ### Added

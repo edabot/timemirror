@@ -53,11 +53,11 @@ const int BUFFER_SIZE = 200;
 enum class ParamFmt { INT, PCT, F1, F1X };
 struct ModeParam {
     float value;
-    const float def, vmin, vmax, step;
+    float def, vmin, vmax, step;   // mutable so settings menu can edit them
     const char* const label;
     const ParamFmt fmt;
-    constexpr ModeParam(float d, float lo, float hi, float s, const char* l,
-                    ParamFmt f = ParamFmt::INT)
+    ModeParam(float d, float lo, float hi, float s, const char* l,
+              ParamFmt f = ParamFmt::INT)
         : value(d), def(d), vmin(lo), vmax(hi), step(s), label(l), fmt(f) {}
     void reset() { value = def; }
     void up()    { value = std::min(vmax, value + step); }
@@ -91,6 +91,27 @@ ModeParam P_turbShift    {20,    2,    60,    2,    "Shift"};
 ModeParam P_tghostSpace  {20,    1,    float(BUFFER_SIZE/7),   1,    "Spacing"};
 ModeParam P_tunnelScale  {3.0f,  1.2f, 8.0f,  0.5f, "Zoom",    ParamFmt::F1X};
 ModeParam P_glowBoost    {0.5f,  0.25f, 6.0f, 0.25f, "Glow",   ParamFmt::F1};
+
+// Settings menu param registry (one entry per ModeParam)
+struct ParamEntry { const char* name; ModeParam* p; };
+static ParamEntry SETTINGS_PARAMS[] = {
+    {"T1  Echo Spacing",     &P_echoSpacing},
+    {"T2  Glow Boost",       &P_glowBoost},
+    {"Y1  Ripple Persist",   &P_rippleDecay},
+    {"Y2  Flow Sens",        &P_flowSens},
+    {"U   Datamosh Trail",   &P_datamosh},
+    {"I   Turb Shift",       &P_turbShift},
+    {"G/H Ghost Spacing",    &P_tghostSpace},
+    {"G2/H2 Tunnel Zoom",    &P_tunnelScale},
+    {"J   Chroma Spread",    &P_chromaSpread},
+    {"K1  Wave Refract",     &P_waveRefract},
+    {"K2  Chroma Wave",      &P_chromaWave},
+    {"Z   Motion Depth",     &P_motionDepth},
+    {"X   Chroma Offset",    &P_chromaOffset},
+    {"C/B Ghost Spacing",    &P_ghostSpace},
+    {"V   Flow Warp",        &P_flowWarp},
+};
+static constexpr int N_SPARAMS = 15;
 
 // Motion mode settings
 const int MOTION_LOOKBACK = 10;  // Frames back for motion comparison (higher = reacts to slower motion)
@@ -178,7 +199,7 @@ enum class Mode {
     PRISMATIC, PRISMATICGHOST,
     FLOWRIPPLE, FLOWHUE,
     DATAMOSH, TURBULENCE,
-    GHOSTECHO, CHROMAGHOSTECHO,
+    GHOSTECHO, CHROMAGHOSTECHO, MASKEDGHOST, CHROMAMASKEDGHOST,
     TIMEGHOST, TUNNELTIMEGHOST,
     RAINBOWGHOST, TUNNELGHOST,
     FLOWWARP, WAVEWARP, CHROMAWAVE
@@ -189,11 +210,15 @@ Mode currentMode = Mode::S;
 // Toggle-pair memory: remembers which variant was last active so returning to a key
 // restores the exact mode the user left, not always the primary variant.
 Mode lastT = Mode::PRISMATIC;
-Mode lastY = Mode::FLOWRIPPLE;
+Mode lastY = Mode::MASKEDGHOST;
 Mode lastG = Mode::RAINBOWGHOST;
 Mode lastH = Mode::TIMEGHOST;
 Mode lastC = Mode::GHOSTECHO;
+Mode lastB = Mode::FLOWRIPPLE;
 Mode lastK = Mode::WAVEWARP;
+enum class ColorMod { NONE, SATURATED, PSYCHEDELIC, FALSE_POSTER, CEL_SHADE, NEON, THERMAL, POSTERIZE, INFRARED, PSYCH_CYCLE, FALSE2, VAPORWAVE };
+ColorMod colorMod = ColorMod::NONE;
+float colorModPhase = 0.f; // incremented once per frame, used by PSYCH_CYCLE
 map<char, steady_clock::time_point> lastKeyTime;
 const double COMBO_WINDOW = 0.5;
 
@@ -450,17 +475,151 @@ Mode checkForCombo(char keyPressed)
 // OpenMP parallelises the per-row / per-column loops across all cores.
 // Each iteration is independent (different row/col of output), so there are
 // no data races.
+// ── Color modifier transforms ────────────────────────────────────────────────
+// Called per-pixel inside OMP loops — no allocations, no branches on hot path.
+
+static inline Vec3b cmSaturated(Vec3b p) {
+    float B=p[0],G=p[1],R=p[2];
+    float lum=0.114f*B+0.587f*G+0.299f*R;
+    B=lum+(B-lum)*2.5f; G=lum+(G-lum)*2.5f; R=lum+(R-lum)*2.5f;
+    B=(B-128.f)*1.5f+128.f; G=(G-128.f)*1.5f+128.f; R=(R-128.f)*1.5f+128.f;
+    return Vec3b((uchar)max(0.f,min(255.f,B)),(uchar)max(0.f,min(255.f,G)),(uchar)max(0.f,min(255.f,R)));
+}
+
+static inline Vec3b cmPsychedelic(Vec3b p) {
+    float luma = 0.114f*p[0] + 0.587f*p[1] + 0.299f*p[2];
+    return Vec3b((uchar)(sinf(luma*0.08f+4.2f)*127.f+128.f),
+                 (uchar)(sinf(luma*0.08f+2.1f)*127.f+128.f),
+                 (uchar)(sinf(luma*0.08f)     *127.f+128.f));
+}
+
+static inline Vec3b cmFalsePoster(Vec3b p) {
+    float luma = 0.114f*p[0] + 0.587f*p[1] + 0.299f*p[2];
+    static const Vec3b pal[5] = {
+        Vec3b(  0,   0, 180),
+        Vec3b(  0, 100, 255),
+        Vec3b(  0, 230, 255),
+        Vec3b(230, 220,   0),
+        Vec3b(220,   0,   0),
+    };
+    return pal[min(4, (int)(luma / 51.2f))];
+}
+
+static inline Vec3b cmCelShade(Vec3b p) {
+    float B=p[0], G=p[1], R=p[2];
+    float luma = 0.114f*B + 0.587f*G + 0.299f*R;
+    float ql = luma < 64 ? 40.f : luma < 128 ? 100.f : luma < 192 ? 168.f : 230.f;
+    float s = luma > 1.f ? ql / luma : 0.f;
+    return Vec3b((uchar)min(255.f,B*s),(uchar)min(255.f,G*s),(uchar)min(255.f,R*s));
+}
+
+static inline Vec3b cmNeon(Vec3b p) {
+    float B=p[0], G=p[1], R=p[2];
+    float lum = 0.114f*B + 0.587f*G + 0.299f*R;
+    B = lum + (B-lum)*6.f; G = lum + (G-lum)*6.f; R = lum + (R-lum)*6.f;
+    return Vec3b((uchar)max(0.f,min(255.f,B)),(uchar)max(0.f,min(255.f,G)),(uchar)max(0.f,min(255.f,R)));
+}
+
+static inline Vec3b cmThermal(Vec3b p) {
+    float t=(0.114f*p[0]+0.587f*p[1]+0.299f*p[2])/255.f;
+    float r,g,b;
+    if(t<0.5f){float u=t*2.f;r=0;g=u;b=1.f-u;}
+    else{float u=(t-0.5f)*2.f;r=u;g=1.f-u;b=0;}
+    return Vec3b((uchar)(b*255),(uchar)(g*255),(uchar)(r*255));
+}
+
+static inline Vec3b cmPosterize(Vec3b p) {
+    auto q=[](uchar v)->uchar{return (v>>6)*85;};
+    return Vec3b(q(p[0]),q(p[1]),q(p[2]));
+}
+
+static inline Vec3b cmInfrared(Vec3b p) {
+    // Inverted luma → black→blue→white (cold glow: dark areas emit, bright areas go dark)
+    float t = 1.f - (0.114f*p[0] + 0.587f*p[1] + 0.299f*p[2]) / 255.f;
+    float r,g,b;
+    if(t<0.5f){float u=t*2.f;r=0;g=0;b=u;}
+    else{float u=(t-0.5f)*2.f;r=u;g=u;b=1.f;}
+    return Vec3b((uchar)(b*255),(uchar)(g*255),(uchar)(r*255));
+}
+
+static inline Vec3b cmPsychCycle(Vec3b p) {
+    float luma = 0.114f*p[0] + 0.587f*p[1] + 0.299f*p[2];
+    float ph = colorModPhase;
+    return Vec3b((uchar)(sinf(luma*0.08f + ph + 4.2f)*127.f+128.f),
+                 (uchar)(sinf(luma*0.08f + ph + 2.1f)*127.f+128.f),
+                 (uchar)(sinf(luma*0.08f + ph)       *127.f+128.f));
+}
+
+static inline Vec3b cmVaporwave(Vec3b p) {
+    float luma = 0.114f*p[0] + 0.587f*p[1] + 0.299f*p[2]; // 0–255
+    // BGR palette: bright colors with dark bands between each
+    static const Vec3f pal[8] = {
+        {198.f,  97.f, 255.f},  // ff61c6  hot pink
+        { 55.f,  12.f,  10.f},  // 0a0c37  very dark (band)
+        {255.f, 236.f,  92.f},  // 5cecff  cyan
+        {113.f,  89.f,  55.f},  // 375971  dark navy (band)
+        { 97.f, 255.f, 244.f},  // f4ff61  yellow-green
+        {113.f,  89.f,  55.f},  // 375971  dark navy (band)
+        {  0.f, 153.f, 255.f},  // ff9900  orange
+        { 55.f,  12.f,  10.f},  // 0a0c37  very dark (band)
+    };
+    // same frequency as PSYCH_CYCLE so band density matches; cycling via colorModPhase
+    float pos = fmodf((luma * 0.07f + colorModPhase * 0.25f) * (8.f / (2.f*3.14159265f)), 8.f);
+    if (pos < 0.f) pos += 8.f;
+    int i = (int)pos;
+    float t = pos - (float)i;
+    t = t*t*(3.f - 2.f*t); // smoothstep — softer band edges
+    const Vec3f &c0 = pal[i], &c1 = pal[(i+1)%8];
+    return Vec3b((uchar)(c0[0]+t*(c1[0]-c0[0])),
+                 (uchar)(c0[1]+t*(c1[1]-c0[1])),
+                 (uchar)(c0[2]+t*(c1[2]-c0[2])));
+}
+
+static inline Vec3b cmFalse2(Vec3b p) {
+    float luma = 0.114f*p[0] + 0.587f*p[1] + 0.299f*p[2];
+    // 5 luma bands → purple→blue→green→yellow→white (BGR)
+    static const Vec3b pal[5] = {
+        Vec3b( 80,   0, 128),  // darkest  → deep purple
+        Vec3b(200,   0,   0),  // dark     → blue
+        Vec3b(  0, 180,   0),  // mid      → green
+        Vec3b(  0, 220, 220),  // bright   → yellow
+        Vec3b(255, 255, 255),  // brightest→ white
+    };
+    return pal[min(4, (int)(luma / 51.2f))];
+}
+
+static inline Vec3b applyColorMod(Vec3b p, ColorMod cm) {
+    switch(cm) {
+        case ColorMod::SATURATED:    return cmSaturated(p);
+        case ColorMod::PSYCHEDELIC:  return cmPsychedelic(p);
+        case ColorMod::FALSE_POSTER: return cmFalsePoster(p);
+        case ColorMod::CEL_SHADE:    return cmCelShade(p);
+        case ColorMod::NEON:         return cmNeon(p);
+        case ColorMod::THERMAL:      return cmThermal(p);
+        case ColorMod::POSTERIZE:    return cmPosterize(p);
+        case ColorMod::INFRARED:     return cmInfrared(p);
+        case ColorMod::PSYCH_CYCLE:  return cmPsychCycle(p);
+        case ColorMod::FALSE2:       return cmFalse2(p);
+        case ColorMod::VAPORWAVE:    return cmVaporwave(p);
+        default:                     return p;
+    }
+}
+
 void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
 {
     if (currentMode == Mode::WS)
     {
         int centerY = height / 2;
+        ColorMod cm = colorMod;
 #pragma omp parallel for schedule(static)
         for (int y = 0; y < height; y++)
         {
             int dist = abs(y - centerY);
             int frameOffset = (bufIdx - 1 - (dist * BUFFER_SIZE / max(centerY, 1)) + BUFFER_SIZE * 2) % BUFFER_SIZE;
-            frameBuffer[frameOffset].row(y).copyTo(output.row(y));
+            if (cm == ColorMod::NONE) { frameBuffer[frameOffset].row(y).copyTo(output.row(y)); continue; }
+            const Vec3b* src = frameBuffer[frameOffset].ptr<Vec3b>(y);
+            Vec3b* dst = output.ptr<Vec3b>(y);
+            for (int x = 0; x < width; x++) dst[x] = applyColorMod(src[x], cm);
         }
     }
     else if (currentMode == Mode::AD)
@@ -472,43 +631,61 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
             int dist = abs(x - centerX);
             colFrame[x] = (bufIdx - 1 - (dist * BUFFER_SIZE / max(centerX, 1)) + BUFFER_SIZE * 2) % BUFFER_SIZE;
         }
-        // Group consecutive columns with the same source frame into strips and
-        // parallelise over strips. Each strip reads one frame sequentially across
-        // all rows (~32 KB), fits in L1 and lets the hardware prefetcher work —
-        // much lower cache-miss cost than jumping across 200 frames per row.
-        struct Strip { int frame, x0, x1; }; // x1 is exclusive
-        vector<Strip> strips;
-        strips.reserve(BUFFER_SIZE * 2 + 2);
-        for (int i = 0, j; i < width; i = j) {
-            int f = colFrame[i];
-            for (j = i + 1; j < width && colFrame[j] == f; ++j) {}
-            strips.push_back({f, i, j});
-        }
+        if (colorMod != ColorMod::NONE) {
+            ColorMod cm = colorMod;
 #pragma omp parallel for schedule(static)
-        for (int si = 0; si < (int)strips.size(); ++si)
-        {
-            const Strip& s = strips[si];
-            size_t off = (size_t)s.x0 * 3, nb = (size_t)(s.x1 - s.x0) * 3;
-            for (int y = 0; y < height; ++y)
-                memcpy(output.ptr(y) + off, frameBuffer[s.frame].ptr(y) + off, nb);
+            for (int y = 0; y < height; ++y) {
+                Vec3b* dst = output.ptr<Vec3b>(y);
+                for (int x = 0; x < width; x++)
+                    dst[x] = applyColorMod(frameBuffer[colFrame[x]].ptr<Vec3b>(y)[x], cm);
+            }
+        } else {
+            // Group consecutive columns with the same source frame into strips and
+            // parallelise over strips. Each strip reads one frame sequentially across
+            // all rows (~32 KB), fits in L1 and lets the hardware prefetcher work —
+            // much lower cache-miss cost than jumping across 200 frames per row.
+            struct Strip { int frame, x0, x1; }; // x1 is exclusive
+            vector<Strip> strips;
+            strips.reserve(BUFFER_SIZE * 2 + 2);
+            for (int i = 0, j; i < width; i = j) {
+                int f = colFrame[i];
+                for (j = i + 1; j < width && colFrame[j] == f; ++j) {}
+                strips.push_back({f, i, j});
+            }
+#pragma omp parallel for schedule(static)
+            for (int si = 0; si < (int)strips.size(); ++si)
+            {
+                const Strip& s = strips[si];
+                size_t off = (size_t)s.x0 * 3, nb = (size_t)(s.x1 - s.x0) * 3;
+                for (int y = 0; y < height; ++y)
+                    memcpy(output.ptr(y) + off, frameBuffer[s.frame].ptr(y) + off, nb);
+            }
         }
     }
     else if (currentMode == Mode::W)
     {
+        ColorMod cm = colorMod;
 #pragma omp parallel for schedule(static)
         for (int y = 0; y < height; y++)
         {
             int frameOffset = (bufIdx - 1 - ((height - 1 - y) * BUFFER_SIZE / height) + BUFFER_SIZE * 2) % BUFFER_SIZE;
-            frameBuffer[frameOffset].row(y).copyTo(output.row(y));
+            if (cm == ColorMod::NONE) { frameBuffer[frameOffset].row(y).copyTo(output.row(y)); continue; }
+            const Vec3b* src = frameBuffer[frameOffset].ptr<Vec3b>(y);
+            Vec3b* dst = output.ptr<Vec3b>(y);
+            for (int x = 0; x < width; x++) dst[x] = applyColorMod(src[x], cm);
         }
     }
     else if (currentMode == Mode::S)
     {
+        ColorMod cm = colorMod;
 #pragma omp parallel for schedule(static)
         for (int y = 0; y < height; y++)
         {
             int frameOffset = (bufIdx - 1 - (y * BUFFER_SIZE / height) + BUFFER_SIZE * 2) % BUFFER_SIZE;
-            frameBuffer[frameOffset].row(y).copyTo(output.row(y));
+            if (cm == ColorMod::NONE) { frameBuffer[frameOffset].row(y).copyTo(output.row(y)); continue; }
+            const Vec3b* src = frameBuffer[frameOffset].ptr<Vec3b>(y);
+            Vec3b* dst = output.ptr<Vec3b>(y);
+            for (int x = 0; x < width; x++) dst[x] = applyColorMod(src[x], cm);
         }
     }
     else if (currentMode == Mode::A)
@@ -516,21 +693,31 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
         vector<int> colFrame(width);
         for (int x = 0; x < width; x++)
             colFrame[x] = (bufIdx - 1 - ((width - 1 - x) * BUFFER_SIZE / width) + BUFFER_SIZE * 2) % BUFFER_SIZE;
-        struct Strip { int frame, x0, x1; };
-        vector<Strip> strips;
-        strips.reserve(BUFFER_SIZE + 2);
-        for (int i = 0, j; i < width; i = j) {
-            int f = colFrame[i];
-            for (j = i + 1; j < width && colFrame[j] == f; ++j) {}
-            strips.push_back({f, i, j});
-        }
+        if (colorMod != ColorMod::NONE) {
+            ColorMod cm = colorMod;
 #pragma omp parallel for schedule(static)
-        for (int si = 0; si < (int)strips.size(); ++si)
-        {
-            const Strip& s = strips[si];
-            size_t off = (size_t)s.x0 * 3, nb = (size_t)(s.x1 - s.x0) * 3;
-            for (int y = 0; y < height; ++y)
-                memcpy(output.ptr(y) + off, frameBuffer[s.frame].ptr(y) + off, nb);
+            for (int y = 0; y < height; ++y) {
+                Vec3b* dst = output.ptr<Vec3b>(y);
+                for (int x = 0; x < width; x++)
+                    dst[x] = applyColorMod(frameBuffer[colFrame[x]].ptr<Vec3b>(y)[x], cm);
+            }
+        } else {
+            struct Strip { int frame, x0, x1; };
+            vector<Strip> strips;
+            strips.reserve(BUFFER_SIZE + 2);
+            for (int i = 0, j; i < width; i = j) {
+                int f = colFrame[i];
+                for (j = i + 1; j < width && colFrame[j] == f; ++j) {}
+                strips.push_back({f, i, j});
+            }
+#pragma omp parallel for schedule(static)
+            for (int si = 0; si < (int)strips.size(); ++si)
+            {
+                const Strip& s = strips[si];
+                size_t off = (size_t)s.x0 * 3, nb = (size_t)(s.x1 - s.x0) * 3;
+                for (int y = 0; y < height; ++y)
+                    memcpy(output.ptr(y) + off, frameBuffer[s.frame].ptr(y) + off, nb);
+            }
         }
     }
     else if (currentMode == Mode::D)
@@ -538,21 +725,31 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
         vector<int> colFrame(width);
         for (int x = 0; x < width; x++)
             colFrame[x] = (bufIdx - 1 - (x * BUFFER_SIZE / width) + BUFFER_SIZE * 2) % BUFFER_SIZE;
-        struct Strip { int frame, x0, x1; };
-        vector<Strip> strips;
-        strips.reserve(BUFFER_SIZE + 2);
-        for (int i = 0, j; i < width; i = j) {
-            int f = colFrame[i];
-            for (j = i + 1; j < width && colFrame[j] == f; ++j) {}
-            strips.push_back({f, i, j});
-        }
+        if (colorMod != ColorMod::NONE) {
+            ColorMod cm = colorMod;
 #pragma omp parallel for schedule(static)
-        for (int si = 0; si < (int)strips.size(); ++si)
-        {
-            const Strip& s = strips[si];
-            size_t off = (size_t)s.x0 * 3, nb = (size_t)(s.x1 - s.x0) * 3;
-            for (int y = 0; y < height; ++y)
-                memcpy(output.ptr(y) + off, frameBuffer[s.frame].ptr(y) + off, nb);
+            for (int y = 0; y < height; ++y) {
+                Vec3b* dst = output.ptr<Vec3b>(y);
+                for (int x = 0; x < width; x++)
+                    dst[x] = applyColorMod(frameBuffer[colFrame[x]].ptr<Vec3b>(y)[x], cm);
+            }
+        } else {
+            struct Strip { int frame, x0, x1; };
+            vector<Strip> strips;
+            strips.reserve(BUFFER_SIZE + 2);
+            for (int i = 0, j; i < width; i = j) {
+                int f = colFrame[i];
+                for (j = i + 1; j < width && colFrame[j] == f; ++j) {}
+                strips.push_back({f, i, j});
+            }
+#pragma omp parallel for schedule(static)
+            for (int si = 0; si < (int)strips.size(); ++si)
+            {
+                const Strip& s = strips[si];
+                size_t off = (size_t)s.x0 * 3, nb = (size_t)(s.x1 - s.x0) * 3;
+                for (int y = 0; y < height; ++y)
+                    memcpy(output.ptr(y) + off, frameBuffer[s.frame].ptr(y) + off, nb);
+            }
         }
     }
     else if (currentMode == Mode::MOTION)
@@ -754,7 +951,7 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
 
         int fi[TGHOST_ECHOES];
         for (int e = 0; e < TGHOST_ECHOES; e++)
-            fi[e] = (base - e * P_tghostSpace.i() + BUFFER_SIZE * 10) % BUFFER_SIZE;
+            fi[e] = (base - e * P_echoSpacing.i() + BUFFER_SIZE * 10) % BUFFER_SIZE;
 
         // Precompute per-echo hue→BGR (cycling like rainbow ghost)
         float eB[TGHOST_ECHOES], eG[TGHOST_ECHOES], eR[TGHOST_ECHOES];
@@ -817,6 +1014,146 @@ void applyTimeDisplacement(Mat &output, int width, int height, int bufIdx)
                     (uchar)(B > 255.0f ? 255 : (int)B),
                     (uchar)(G > 255.0f ? 255 : (int)G),
                     (uchar)(R > 255.0f ? 255 : (int)R));
+            }
+        }
+    }
+    else if (currentMode == Mode::MASKEDGHOST)
+    {
+        // Mask layer:  5 tunnel-zoomed Vision masks OR'd into one union silhouette.
+        // Image layer: 10 echoes additively accumulated within the union mask.
+        int base = segReady.load(memory_order_acquire);
+        if (base < 0) { output.setTo(Scalar(0,0,0)); return; }
+
+        static const int NM = 5, NI = 10;
+
+        // Mask echoes: P_tghostSpace spacing, no zoom — straight 1:1 reads
+        int mfi[NM];
+        for (int e = 0; e < NM; e++)
+            mfi[e] = (base - e * P_tghostSpace.i() + BUFFER_SIZE*10) % BUFFER_SIZE;
+
+        // Image echoes: P_ghostSpace spacing, linear fade weights
+        int ifi[NI]; float iw[NI]; float wsum = 0;
+        for (int e = 0; e < NI; e++) {
+            ifi[e] = (base - e * P_ghostSpace.i() + BUFFER_SIZE*10) % BUFFER_SIZE;
+            iw[e]  = 1.0f - (float)e / NI;
+            wsum  += iw[e];
+        }
+        float invWsum = 1.0f / wsum;
+
+        float cx = (width-1)*0.5f, cy = (height-1)*0.5f, ro = ringOffset;
+#pragma omp parallel for schedule(static)
+        for (int y = 0; y < height; y++)
+        {
+            // Mask rows — no zoom, direct read
+            const uchar *maskRowE[NM];
+            for (int e = 0; e < NM; e++)
+                maskRowE[e] = maskBuffer[mfi[e]].ptr<uchar>(y);
+            // Image rows (no zoom)
+            const Vec3b *frameRowI[NI];
+            for (int e = 0; e < NI; e++)
+                frameRowI[e] = frameBuffer[ifi[e]].ptr<Vec3b>(y);
+
+            Vec3b *outRow = output.ptr<Vec3b>(y);
+            float dy2 = (y - cy) * (y - cy);
+            for (int x = 0; x < width; x++)
+            {
+                // Ring backdrop
+                float dist  = sqrtf(dy2 + (x-cx)*(x-cx));
+                float phase = fmodf(dist - ro + RING_SPACING*1000.f, RING_SPACING);
+                uchar rv    = (phase < RING_SPACING*0.5f) ? 35 : 0;
+                outRow[x]   = Vec3b(rv, rv, rv);
+
+                // Boolean union of 5 masks
+                float unionAlpha = 0.f;
+                for (int e = 0; e < NM; e++)
+                    unionAlpha = std::max(unionAlpha, maskRowE[e][x] / 255.f);
+                if (unionAlpha < 0.05f) continue;
+
+                // 10 additive image echoes, normalised and gated by union mask
+                float B = 0, G = 0, R = 0;
+                for (int e = 0; e < NI; e++) {
+                    const Vec3b& p = frameRowI[e][x];
+                    B += p[0] * iw[e];
+                    G += p[1] * iw[e];
+                    R += p[2] * iw[e];
+                }
+                float scale = unionAlpha * invWsum;
+                outRow[x] = Vec3b((uchar)min(255.f, B*scale),
+                                  (uchar)min(255.f, G*scale),
+                                  (uchar)min(255.f, R*scale));
+            }
+        }
+    }
+    else if (currentMode == Mode::CHROMAMASKEDGHOST)
+    {
+        // Chroma variant of Masked Ghost: same 5-mask union, but image echoes tinted
+        // with cycling spectral hues (luma × hue, additive) instead of natural colour.
+        int base = segReady.load(memory_order_acquire);
+        if (base < 0) { output.setTo(Scalar(0,0,0)); return; }
+
+        static const int NM = 5, NI = 10;
+
+        int mfi[NM];
+        for (int e = 0; e < NM; e++)
+            mfi[e] = (base - e * P_tghostSpace.i() + BUFFER_SIZE*10) % BUFFER_SIZE;
+
+        int ifi[NI]; float iw[NI]; float wsum = 0;
+        for (int e = 0; e < NI; e++) {
+            ifi[e] = (base - e * P_ghostSpace.i() + BUFFER_SIZE*10) % BUFFER_SIZE;
+            iw[e]  = 1.0f - (float)e / NI;
+            wsum  += iw[e];
+        }
+        float invWsum = 1.0f / wsum;
+
+        // Per-echo spectral hue (same pattern as Chroma Ghost Echo)
+        float eB[NI], eG[NI], eR[NI];
+        for (int e = 0; e < NI; e++) {
+            float hue = fmod(rainbowHue - e * RAINBOW_HUE_STEP + 360.f * NI, 360.f);
+            float h6 = hue / 60.f; int hi = (int)h6 % 6; float f = h6-(int)h6, q = 1.f-f;
+            switch (hi) {
+            case 0: eR[e]=1;eG[e]=f;eB[e]=0;break; case 1: eR[e]=q;eG[e]=1;eB[e]=0;break;
+            case 2: eR[e]=0;eG[e]=1;eB[e]=f;break; case 3: eR[e]=0;eG[e]=q;eB[e]=1;break;
+            case 4: eR[e]=f;eG[e]=0;eB[e]=1;break; default:eR[e]=1;eG[e]=0;eB[e]=q;break;
+            }
+        }
+
+        float cx = (width-1)*0.5f, cy = (height-1)*0.5f, ro = ringOffset;
+#pragma omp parallel for schedule(static)
+        for (int y = 0; y < height; y++)
+        {
+            const uchar *maskRowE[NM];
+            for (int e = 0; e < NM; e++)
+                maskRowE[e] = maskBuffer[mfi[e]].ptr<uchar>(y);
+            const Vec3b *frameRowI[NI];
+            for (int e = 0; e < NI; e++)
+                frameRowI[e] = frameBuffer[ifi[e]].ptr<Vec3b>(y);
+
+            Vec3b *outRow = output.ptr<Vec3b>(y);
+            float dy2 = (y - cy) * (y - cy);
+            for (int x = 0; x < width; x++)
+            {
+                float dist  = sqrtf(dy2 + (x-cx)*(x-cx));
+                float phase = fmodf(dist - ro + RING_SPACING*1000.f, RING_SPACING);
+                uchar rv    = (phase < RING_SPACING*0.5f) ? 35 : 0;
+                outRow[x]   = Vec3b(rv, rv, rv);
+
+                float unionAlpha = 0.f;
+                for (int e = 0; e < NM; e++)
+                    unionAlpha = std::max(unionAlpha, maskRowE[e][x] / 255.f);
+                if (unionAlpha < 0.05f) continue;
+
+                float B = 0, G = 0, R = 0;
+                for (int e = 0; e < NI; e++) {
+                    const Vec3b& p = frameRowI[e][x];
+                    float lum = (0.114f*p[0] + 0.587f*p[1] + 0.299f*p[2]) * (1.f/255.f);
+                    B += eB[e] * lum * iw[e];
+                    G += eG[e] * lum * iw[e];
+                    R += eR[e] * lum * iw[e];
+                }
+                float scale = unionAlpha * invWsum * 2.0f * 255.f;
+                outRow[x] = Vec3b((uchar)min(255.f, B*scale),
+                                  (uchar)min(255.f, G*scale),
+                                  (uchar)min(255.f, R*scale));
             }
         }
     }
@@ -1461,12 +1798,14 @@ string getModeName()
         case Mode::MCHROMA:        return "J: Motion Chromatic";
         case Mode::PRISMATIC:      return "T: Prismatic Echo";
         case Mode::PRISMATICGHOST: return "T: Prismatic Ghost";
-        case Mode::FLOWHUE:        return "Y: Flow Direction Color";
-        case Mode::FLOWRIPPLE:     return "Y: Flow Color Ripple";
+        case Mode::FLOWHUE:        return "B: Flow Direction Color";
+        case Mode::FLOWRIPPLE:     return "B: Flow Color Ripple";
         case Mode::DATAMOSH:       return "U: Datamosh";
         case Mode::TURBULENCE:     return "I: Turbulence";
         case Mode::GHOSTECHO:      return "C: Ghost Echo";
         case Mode::CHROMAGHOSTECHO:return "C: Chroma Ghost Echo";
+        case Mode::MASKEDGHOST:        return "Y: Masked Ghost";
+        case Mode::CHROMAMASKEDGHOST:  return "Y: Chroma Masked Ghost";
         case Mode::TIMEGHOST:      return "H: Temporal Ghost";
         case Mode::TUNNELTIMEGHOST:return "H: Tunnel Time Ghost";
         case Mode::RAINBOWGHOST:   return "G: Rainbow Ghost";
@@ -1497,9 +1836,131 @@ void drawValueOverlay(Mat &output, const string &text, double timeSinceChange)
     putText(output, speedText, textPos, fontFace, fontScale, Scalar(255, 255, 255), thickness);
 }
 
+// ── Settings save / load ──────────────────────────────────────────────────────
+
+static const char* SETTINGS_FILE = "settings.cfg";
+
+static void saveSettings()
+{
+    FILE* f = fopen(SETTINGS_FILE, "w");
+    if (!f) { fprintf(stderr, "Could not write %s\n", SETTINGS_FILE); return; }
+    fprintf(f, "timemirror_settings_v1\n");
+    for (int i = 0; i < N_SPARAMS; i++) {
+        const ModeParam* p = SETTINGS_PARAMS[i].p;
+        fprintf(f, "%g %g %g %g %g\n", p->value, p->def, p->vmin, p->vmax, p->step);
+    }
+    fclose(f);
+    printf("Settings saved → %s\n", SETTINGS_FILE);
+}
+
+static void loadSettings()
+{
+    FILE* f = fopen(SETTINGS_FILE, "r");
+    if (!f) return;
+    char hdr[64] = {};
+    if (!fgets(hdr, sizeof(hdr), f) || strncmp(hdr, "timemirror_settings_v1", 22) != 0)
+        { fclose(f); return; }
+    for (int i = 0; i < N_SPARAMS; i++) {
+        ModeParam* p = SETTINGS_PARAMS[i].p;
+        float v, d, lo, hi, s;
+        if (fscanf(f, "%g %g %g %g %g\n", &v, &d, &lo, &hi, &s) == 5) {
+            p->value = v; p->def = d; p->vmin = lo; p->vmax = hi; p->step = s;
+        }
+    }
+    fclose(f);
+    printf("Settings loaded ← %s\n", SETTINGS_FILE);
+}
+
+// ── Settings menu ─────────────────────────────────────────────────────────────
+
+static void settingsAdjust(int row, int col, float dir)
+{
+    ModeParam* p = SETTINGS_PARAMS[row].p;
+    float s = (p->fmt == ParamFmt::PCT) ? 0.01f :
+              (p->fmt == ParamFmt::INT) ? 1.f : p->step;
+    switch (col) {
+        case 0: p->value = std::max(p->vmin, std::min(p->vmax, p->value + dir * p->step)); break;
+        case 1: p->def   = std::max(p->vmin, std::min(p->vmax, p->def   + dir * p->step)); break;
+        case 2: p->vmin  = std::min(p->vmax - p->step, p->vmin + dir * s);
+                p->value = std::max(p->value, p->vmin); break;
+        case 3: p->vmax  = std::max(p->vmin + p->step, p->vmax + dir * s);
+                p->value = std::min(p->value, p->vmax); break;
+        case 4: p->step  = std::max(0.001f, p->step + dir * s); break;
+    }
+}
+
+static void drawSettingsOverlay(Mat& out, int row, int col)
+{
+    const int W = out.cols;
+    const int PX = 30, PY = 20;
+    const int PW = 760, RH = 34;
+    const int PH = (N_SPARAMS + 3) * RH + 10;
+
+    // dark panel
+    cv::rectangle(out, {PX, PY}, {PX+PW, PY+PH}, Scalar(12,12,18), -1);
+    cv::rectangle(out, {PX, PY}, {PX+PW, PY+PH}, Scalar(80,80,100), 1);
+
+    const double FS = 0.52;
+    const int TH = 22; // text baseline offset within each row
+
+    // column x positions relative to PX
+    const int cx[] = {10, 300, 390, 470, 550, 650};
+    const char* hdr[] = {"PARAM", "VAL", "DEFAULT", "MIN", "MAX", "STEP"};
+
+    // title
+    putText(out, "SETTINGS    up/dn=row   lt/rt=col   +/-=adjust   s=save   ;=close",
+            {PX+cx[0], PY+TH}, FONT_HERSHEY_SIMPLEX, FS, Scalar(160,160,160), 1);
+
+    // header
+    int hy = PY + RH + TH;
+    for (int c = 0; c < 6; c++) {
+        Scalar hc = (c > 0 && c-1 == col) ? Scalar(80,220,255) : Scalar(130,130,150);
+        putText(out, hdr[c], {PX+cx[c], hy}, FONT_HERSHEY_SIMPLEX, FS, hc, 1);
+    }
+
+    // divider
+    cv::line(out, {PX+4, PY+2*RH}, {PX+PW-4, PY+2*RH}, Scalar(60,60,80), 1);
+
+    auto fmtVal = [](const ModeParam* p, float v) -> std::string {
+        char buf[32];
+        switch (p->fmt) {
+            case ParamFmt::INT: snprintf(buf,32,"%d",(int)v); break;
+            case ParamFmt::PCT: snprintf(buf,32,"%d%%",(int)(v*100+.5f)); break;
+            case ParamFmt::F1:  snprintf(buf,32,"%.2f",v); break;
+            case ParamFmt::F1X: snprintf(buf,32,"%.2fx",v); break;
+        }
+        return buf;
+    };
+
+    for (int r = 0; r < N_SPARAMS; r++) {
+        const ModeParam* p = SETTINGS_PARAMS[r].p;
+        int ry = PY + (r+2)*RH + TH;
+        bool selRow = (r == row);
+
+        if (selRow)
+            cv::rectangle(out, {PX+2, PY+(r+2)*RH+3}, {PX+PW-2, PY+(r+3)*RH+1},
+                          Scalar(30,30,50), -1);
+
+        Scalar nc = selRow ? Scalar(255,255,255) : Scalar(160,160,160);
+        putText(out, SETTINGS_PARAMS[r].name, {PX+cx[0], ry},
+                FONT_HERSHEY_SIMPLEX, FS, nc, 1);
+
+        float vals[5] = {p->value, p->def, p->vmin, p->vmax, p->step};
+        for (int c = 0; c < 5; c++) {
+            bool selCell = selRow && (c == col);
+            Scalar vc = selCell    ? Scalar(80,220,255)
+                      : selRow     ? Scalar(220,220,180)
+                                   : Scalar(140,140,130);
+            putText(out, fmtVal(p, vals[c]), {PX+cx[c+1], ry},
+                    FONT_HERSHEY_SIMPLEX, FS, vc, 1);
+        }
+    }
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 int main()
 {
+    loadSettings();
     cout << "========================================" << endl;
     cout << "Time Mirror Effect - C++ Version" << endl;
     cout << "High Performance Implementation" << endl;
@@ -1598,6 +2059,7 @@ int main()
         maskBuffer[i] = Mat::zeros(actualHeight, actualWidth, CV_8U);
 
     namedWindow("Time Mirror Effect", WINDOW_NORMAL);
+    setWindowProperty("Time Mirror Effect", WND_PROP_FULLSCREEN, WINDOW_FULLSCREEN);
     resizeWindow("Time Mirror Effect", 1280, 720);
 
     cout << "\nKEYBOARD CONTROLS:" << endl;
@@ -1642,11 +2104,15 @@ int main()
     double fps = 0;
     auto fpsStartTime = steady_clock::now();
     int fpsFrameCount = 0;
-    bool isFullscreen = false;
+    bool isFullscreen = true;
 
     auto lastOverlayTime = steady_clock::now();
     bool overlayActive = false;
     string overlayText;
+
+    bool settingsMode = false;
+    int  settingsRow  = 0;
+    int  settingsCol  = 0; // 0=val 1=def 2=min 3=max 4=step
 
     while (running)
     {
@@ -1716,12 +2182,14 @@ int main()
 
         // Advance rainbow hue — used by rainbowghost and tunnelghost modes.
         if (currentMode == Mode::RAINBOWGHOST || currentMode == Mode::TUNNELGHOST ||
-            currentMode == Mode::CHROMAGHOSTECHO || currentMode == Mode::PRISMATICGHOST)
+            currentMode == Mode::CHROMAGHOSTECHO || currentMode == Mode::PRISMATICGHOST ||
+            currentMode == Mode::CHROMAMASKEDGHOST)
             rainbowHue = fmod(rainbowHue + rainbowSpeed / 60.0f, 360.0f);
         // Advance ring backdrop phase — used by ghost modes and ring warp.
         if (currentMode == Mode::RAINBOWGHOST || currentMode == Mode::TIMEGHOST ||
             currentMode == Mode::TUNNELGHOST || currentMode == Mode::TUNNELTIMEGHOST ||
-            currentMode == Mode::PRISMATICGHOST || currentMode == Mode::FLOWWARP)
+            currentMode == Mode::PRISMATICGHOST || currentMode == Mode::MASKEDGHOST ||
+            currentMode == Mode::CHROMAMASKEDGHOST || currentMode == Mode::FLOWWARP)
             ringOffset = fmodf(ringOffset + RING_SPEED / 60.0f, RING_SPACING);
 
         // Update flow ripple buffer — advect, decay, inject — used by flowripple mode.
@@ -1821,6 +2289,7 @@ int main()
             rippleTmp.copyTo(rippleBuffer);
         }
 
+        colorModPhase += 0.05f; if (colorModPhase > 25.1327f) colorModPhase -= 25.1327f;
         applyTimeDisplacement(output, actualWidth, actualHeight, bufIdx);
 
         // FPS
@@ -1841,84 +2310,169 @@ int main()
                 overlayActive = false;
         }
 
+        if (settingsMode) drawSettingsOverlay(output, settingsRow, settingsCol);
+
         imshow("Time Mirror Effect", output);
 
         int key = waitKey(1);
-        if (key == 'q' || key == 27)
+        if (key == 'q')
         {
             running = false;
             break;
         }
 
-        if (key == 'w')
+        if (settingsMode)
+        {
+            if      (key == 27 || key == ';') settingsMode = false;
+            else if (key == 0)   settingsRow = std::max(0, settingsRow - 1);
+            else if (key == 1)   settingsRow = std::min(N_SPARAMS - 1, settingsRow + 1);
+            else if (key == 2)   settingsCol = std::max(0, settingsCol - 1);
+            else if (key == 3)   settingsCol = std::min(4, settingsCol + 1);
+            else if (key == '=' || key == '+') settingsAdjust(settingsRow, settingsCol, +1.f);
+            else if (key == '-') settingsAdjust(settingsRow, settingsCol, -1.f);
+            else if (key == 's') { saveSettings();
+                overlayText = "Settings saved"; lastOverlayTime = steady_clock::now(); overlayActive = true; }
+        }
+        else if (key == 27) { running = false; break; }
+        else if (key == ';') { settingsMode = true; settingsRow = 0; settingsCol = 0; }
+        else if (key == 'w')
         {
             currentMode = checkForCombo('w');
+            { auto _n=steady_clock::now(); static const pair<char,ColorMod> _cm[]={{'t',ColorMod::PSYCH_CYCLE},{'y',ColorMod::VAPORWAVE},{'u',ColorMod::FALSE_POSTER},{'i',ColorMod::CEL_SHADE},{'g',ColorMod::NEON},{'h',ColorMod::THERMAL},{'j',ColorMod::FALSE2},{'k',ColorMod::INFRARED}}; for(auto&[k,c]:_cm){auto it=lastKeyTime.find(k);if(it!=lastKeyTime.end()&&duration<double>(_n-it->second).count()<COMBO_WINDOW){colorMod=c;break;}} }
             cout << "Mode: " << getModeName() << endl;
         }
         else if (key == 's')
         {
             currentMode = checkForCombo('s');
+            { auto _n=steady_clock::now(); static const pair<char,ColorMod> _cm[]={{'t',ColorMod::PSYCH_CYCLE},{'y',ColorMod::VAPORWAVE},{'u',ColorMod::FALSE_POSTER},{'i',ColorMod::CEL_SHADE},{'g',ColorMod::NEON},{'h',ColorMod::THERMAL},{'j',ColorMod::FALSE2},{'k',ColorMod::INFRARED}}; for(auto&[k,c]:_cm){auto it=lastKeyTime.find(k);if(it!=lastKeyTime.end()&&duration<double>(_n-it->second).count()<COMBO_WINDOW){colorMod=c;break;}} }
             cout << "Mode: " << getModeName() << endl;
         }
         else if (key == 'a')
         {
             currentMode = checkForCombo('a');
+            { auto _n=steady_clock::now(); static const pair<char,ColorMod> _cm[]={{'t',ColorMod::PSYCH_CYCLE},{'y',ColorMod::VAPORWAVE},{'u',ColorMod::FALSE_POSTER},{'i',ColorMod::CEL_SHADE},{'g',ColorMod::NEON},{'h',ColorMod::THERMAL},{'j',ColorMod::FALSE2},{'k',ColorMod::INFRARED}}; for(auto&[k,c]:_cm){auto it=lastKeyTime.find(k);if(it!=lastKeyTime.end()&&duration<double>(_n-it->second).count()<COMBO_WINDOW){colorMod=c;break;}} }
             cout << "Mode: " << getModeName() << endl;
         }
         else if (key == 'd')
         {
             currentMode = checkForCombo('d');
+            { auto _n=steady_clock::now(); static const pair<char,ColorMod> _cm[]={{'t',ColorMod::PSYCH_CYCLE},{'y',ColorMod::VAPORWAVE},{'u',ColorMod::FALSE_POSTER},{'i',ColorMod::CEL_SHADE},{'g',ColorMod::NEON},{'h',ColorMod::THERMAL},{'j',ColorMod::FALSE2},{'k',ColorMod::INFRARED}}; for(auto&[k,c]:_cm){auto it=lastKeyTime.find(k);if(it!=lastKeyTime.end()&&duration<double>(_n-it->second).count()<COMBO_WINDOW){colorMod=c;break;}} }
             cout << "Mode: " << getModeName() << endl;
         }
         else if (key == 'z')
         {
+            colorMod = ColorMod::NONE;
             currentMode = Mode::MOTION;
             cout << "Mode: " << getModeName() << endl;
         }
         else if (key == 'x')
         {
+            colorMod = ColorMod::NONE;
             currentMode = Mode::CHROMA;
             cout << "Mode: " << getModeName() << endl;
         }
         else if (key == 'j')
         {
-            currentMode = Mode::MCHROMA;
-            cout << "Mode: " << getModeName() << endl;
+            auto _now = steady_clock::now(); lastKeyTime['j'] = _now;
+            bool _combo = false;
+            for (char dk : {'w','s','a','d'}) { auto it=lastKeyTime.find(dk); if(it!=lastKeyTime.end()&&duration<double>(_now-it->second).count()<COMBO_WINDOW){_combo=true;break;} }
+            if (_combo) { colorMod=ColorMod::FALSE2; overlayText="Color: False 2"; lastOverlayTime=_now; overlayActive=true; cout<<"Color: False 2"<<endl; }
+            else { colorMod=ColorMod::NONE; currentMode=Mode::MCHROMA; cout<<"Mode: "<<getModeName()<<endl; }
         }
         else if (key == 't')
         {
-            if (currentMode == Mode::PRISMATIC || currentMode == Mode::PRISMATICGHOST)
-                currentMode = (currentMode == Mode::PRISMATIC) ? Mode::PRISMATICGHOST : Mode::PRISMATIC;
-            else
-                currentMode = lastT;
-            lastT = currentMode;
-            cout << "Mode: " << getModeName() << endl;
+            auto _now = steady_clock::now(); lastKeyTime['t'] = _now;
+            bool _combo = false;
+            for (char dk : {'w','s','a','d'}) { auto it=lastKeyTime.find(dk); if(it!=lastKeyTime.end()&&duration<double>(_now-it->second).count()<COMBO_WINDOW){_combo=true;break;} }
+            if (_combo) { colorMod=ColorMod::PSYCH_CYCLE; overlayText="Color: Psych Cycle"; lastOverlayTime=_now; overlayActive=true; cout<<"Color: Psych Cycle"<<endl; }
+            else {
+                colorMod = ColorMod::NONE;
+                if (currentMode == Mode::PRISMATIC || currentMode == Mode::PRISMATICGHOST)
+                    currentMode = (currentMode == Mode::PRISMATIC) ? Mode::PRISMATICGHOST : Mode::PRISMATIC;
+                else
+                    currentMode = lastT;
+                lastT = currentMode;
+                cout << "Mode: " << getModeName() << endl;
+            }
         }
         else if (key == 'y')
         {
-            if (currentMode == Mode::FLOWRIPPLE || currentMode == Mode::FLOWHUE)
-                currentMode = (currentMode == Mode::FLOWRIPPLE) ? Mode::FLOWHUE : Mode::FLOWRIPPLE;
-            else
-                currentMode = lastY;
-            lastY = currentMode;
-            if (currentMode == Mode::FLOWRIPPLE) rippleBuffer.setTo(0);
-            cout << "Mode: " << getModeName() << endl;
-        }
-        else if (key == 'i')
-        {
-            currentMode = Mode::TURBULENCE;
-            turbulenceMap.setTo(0);
-            turbFrame = 0;
-            cout << "Mode: " << getModeName() << endl;
+            auto _now = steady_clock::now(); lastKeyTime['y'] = _now;
+            bool _combo = false;
+            for (char dk : {'w','s','a','d'}) { auto it=lastKeyTime.find(dk); if(it!=lastKeyTime.end()&&duration<double>(_now-it->second).count()<COMBO_WINDOW){_combo=true;break;} }
+            if (_combo) { colorMod=ColorMod::VAPORWAVE; overlayText="Color: Vaporwave"; lastOverlayTime=_now; overlayActive=true; cout<<"Color: Vaporwave"<<endl; }
+            else {
+                colorMod = ColorMod::NONE;
+                if (currentMode == Mode::MASKEDGHOST || currentMode == Mode::CHROMAMASKEDGHOST)
+                    currentMode = (currentMode == Mode::MASKEDGHOST) ? Mode::CHROMAMASKEDGHOST : Mode::MASKEDGHOST;
+                else
+                    currentMode = lastY;
+                lastY = currentMode;
+                cout << "Mode: " << getModeName() << endl;
+            }
         }
         else if (key == 'u')
         {
-            currentMode = Mode::DATAMOSH;
-            datamoshAccum.setTo(0); // fresh slate each entry
-            cout << "Mode: " << getModeName() << endl;
+            auto _now = steady_clock::now(); lastKeyTime['u'] = _now;
+            bool _combo = false;
+            for (char dk : {'w','s','a','d'}) { auto it=lastKeyTime.find(dk); if(it!=lastKeyTime.end()&&duration<double>(_now-it->second).count()<COMBO_WINDOW){_combo=true;break;} }
+            if (_combo) { colorMod=ColorMod::FALSE_POSTER; overlayText="Color: False Poster"; lastOverlayTime=_now; overlayActive=true; cout<<"Color: False Poster"<<endl; }
+            else {
+                colorMod = ColorMod::NONE;
+                currentMode = Mode::DATAMOSH;
+                datamoshAccum.setTo(0);
+                cout << "Mode: " << getModeName() << endl;
+            }
+        }
+        else if (key == 'i')
+        {
+            auto _now = steady_clock::now(); lastKeyTime['i'] = _now;
+            bool _combo = false;
+            for (char dk : {'w','s','a','d'}) { auto it=lastKeyTime.find(dk); if(it!=lastKeyTime.end()&&duration<double>(_now-it->second).count()<COMBO_WINDOW){_combo=true;break;} }
+            if (_combo) { colorMod=ColorMod::CEL_SHADE; overlayText="Color: Cel Shade"; lastOverlayTime=_now; overlayActive=true; cout<<"Color: Cel Shade"<<endl; }
+            else {
+                colorMod = ColorMod::NONE;
+                currentMode = Mode::TURBULENCE;
+                turbulenceMap.setTo(0);
+                turbFrame = 0;
+                cout << "Mode: " << getModeName() << endl;
+            }
+        }
+        else if (key == 'g')
+        {
+            auto _now = steady_clock::now(); lastKeyTime['g'] = _now;
+            bool _combo = false;
+            for (char dk : {'w','s','a','d'}) { auto it=lastKeyTime.find(dk); if(it!=lastKeyTime.end()&&duration<double>(_now-it->second).count()<COMBO_WINDOW){_combo=true;break;} }
+            if (_combo) { colorMod=ColorMod::NEON; overlayText="Color: Neon"; lastOverlayTime=_now; overlayActive=true; cout<<"Color: Neon"<<endl; }
+            else {
+                colorMod = ColorMod::NONE;
+                if (currentMode == Mode::RAINBOWGHOST || currentMode == Mode::TUNNELGHOST)
+                    currentMode = (currentMode == Mode::RAINBOWGHOST) ? Mode::TUNNELGHOST : Mode::RAINBOWGHOST;
+                else
+                    currentMode = lastG;
+                lastG = currentMode;
+                cout << "Mode: " << getModeName() << endl;
+            }
+        }
+        else if (key == 'h')
+        {
+            auto _now = steady_clock::now(); lastKeyTime['h'] = _now;
+            bool _combo = false;
+            for (char dk : {'w','s','a','d'}) { auto it=lastKeyTime.find(dk); if(it!=lastKeyTime.end()&&duration<double>(_now-it->second).count()<COMBO_WINDOW){_combo=true;break;} }
+            if (_combo) { colorMod=ColorMod::THERMAL; overlayText="Color: Thermal"; lastOverlayTime=_now; overlayActive=true; cout<<"Color: Thermal"<<endl; }
+            else {
+                colorMod = ColorMod::NONE;
+                if (currentMode == Mode::TIMEGHOST || currentMode == Mode::TUNNELTIMEGHOST)
+                    currentMode = (currentMode == Mode::TIMEGHOST) ? Mode::TUNNELTIMEGHOST : Mode::TIMEGHOST;
+                else
+                    currentMode = lastH;
+                lastH = currentMode;
+                cout << "Mode: " << getModeName() << endl;
+            }
         }
         else if (key == 'c')
         {
+            colorMod = ColorMod::NONE;
             if (currentMode == Mode::GHOSTECHO || currentMode == Mode::CHROMAGHOSTECHO)
                 currentMode = (currentMode == Mode::GHOSTECHO) ? Mode::CHROMAGHOSTECHO : Mode::GHOSTECHO;
             else
@@ -1926,44 +2480,45 @@ int main()
             lastC = currentMode;
             cout << "Mode: " << getModeName() << endl;
         }
-        else if (key == 'h')
+        else if (key == 'b')
         {
-            if (currentMode == Mode::TIMEGHOST || currentMode == Mode::TUNNELTIMEGHOST)
-                currentMode = (currentMode == Mode::TIMEGHOST) ? Mode::TUNNELTIMEGHOST : Mode::TIMEGHOST;
+            colorMod = ColorMod::NONE;
+            if (currentMode == Mode::FLOWRIPPLE || currentMode == Mode::FLOWHUE)
+                currentMode = (currentMode == Mode::FLOWRIPPLE) ? Mode::FLOWHUE : Mode::FLOWRIPPLE;
             else
-                currentMode = lastH;
-            lastH = currentMode;
-            cout << "Mode: " << getModeName() << endl;
-        }
-        else if (key == 'g')
-        {
-            if (currentMode == Mode::RAINBOWGHOST || currentMode == Mode::TUNNELGHOST)
-                currentMode = (currentMode == Mode::RAINBOWGHOST) ? Mode::TUNNELGHOST : Mode::RAINBOWGHOST;
-            else
-                currentMode = lastG;
-            lastG = currentMode;
+                currentMode = lastB;
+            lastB = currentMode;
+            if (currentMode == Mode::FLOWRIPPLE) rippleBuffer.setTo(0);
             cout << "Mode: " << getModeName() << endl;
         }
         else if (key == 'v')
         {
+            colorMod = ColorMod::NONE;
             currentMode = Mode::FLOWWARP;
             cout << "Mode: " << getModeName() << endl;
         }
         else if (key == 'k')
         {
-            if (currentMode == Mode::WAVEWARP || currentMode == Mode::CHROMAWAVE)
-                currentMode = (currentMode == Mode::WAVEWARP) ? Mode::CHROMAWAVE : Mode::WAVEWARP;
-            else
-                currentMode = lastK;
-            lastK = currentMode;
-            if (currentMode == Mode::CHROMAWAVE) {
-                waveAr.setTo(0); waveBr.setTo(0);
-                waveAg.setTo(0); waveBg.setTo(0);
-                waveAb.setTo(0); waveBb.setTo(0);
-            } else {
-                waveA.setTo(0); waveB.setTo(0);
+            auto _now = steady_clock::now(); lastKeyTime['k'] = _now;
+            bool _combo = false;
+            for (char dk : {'w','s','a','d'}) { auto it=lastKeyTime.find(dk); if(it!=lastKeyTime.end()&&duration<double>(_now-it->second).count()<COMBO_WINDOW){_combo=true;break;} }
+            if (_combo) { colorMod=ColorMod::INFRARED; overlayText="Color: Infrared"; lastOverlayTime=_now; overlayActive=true; cout<<"Color: Infrared"<<endl; }
+            else {
+                colorMod = ColorMod::NONE;
+                if (currentMode == Mode::WAVEWARP || currentMode == Mode::CHROMAWAVE)
+                    currentMode = (currentMode == Mode::WAVEWARP) ? Mode::CHROMAWAVE : Mode::WAVEWARP;
+                else
+                    currentMode = lastK;
+                lastK = currentMode;
+                if (currentMode == Mode::CHROMAWAVE) {
+                    waveAr.setTo(0); waveBr.setTo(0);
+                    waveAg.setTo(0); waveBg.setTo(0);
+                    waveAb.setTo(0); waveBb.setTo(0);
+                } else {
+                    waveA.setTo(0); waveB.setTo(0);
+                }
+                cout << "Mode: " << getModeName() << endl;
             }
-            cout << "Mode: " << getModeName() << endl;
         }
         else if (key == 'f')
         {
@@ -1985,6 +2540,7 @@ int main()
             else if (currentMode == Mode::FLOWRIPPLE)                                 p = &P_rippleDecay;
             else if (currentMode == Mode::TURBULENCE)                                 p = &P_turbShift;
             else if (currentMode == Mode::GHOSTECHO || currentMode == Mode::CHROMAGHOSTECHO) p = &P_ghostSpace;
+            else if (currentMode == Mode::MASKEDGHOST || currentMode == Mode::CHROMAMASKEDGHOST) p = &P_tghostSpace;
             else if (currentMode == Mode::TIMEGHOST  || currentMode == Mode::RAINBOWGHOST)   p = &P_tghostSpace;
             else if (currentMode == Mode::TUNNELGHOST || currentMode == Mode::TUNNELTIMEGHOST) p = &P_tunnelScale;
             else if (currentMode == Mode::PRISMATICGHOST)                             p = &P_glowBoost;
@@ -2009,6 +2565,7 @@ int main()
             else if (currentMode == Mode::FLOWRIPPLE)                                 p = &P_rippleDecay;
             else if (currentMode == Mode::TURBULENCE)                                 p = &P_turbShift;
             else if (currentMode == Mode::GHOSTECHO || currentMode == Mode::CHROMAGHOSTECHO) p = &P_ghostSpace;
+            else if (currentMode == Mode::MASKEDGHOST || currentMode == Mode::CHROMAMASKEDGHOST) p = &P_tghostSpace;
             else if (currentMode == Mode::TIMEGHOST  || currentMode == Mode::RAINBOWGHOST)   p = &P_tghostSpace;
             else if (currentMode == Mode::TUNNELGHOST || currentMode == Mode::TUNNELTIMEGHOST) p = &P_tunnelScale;
             else if (currentMode == Mode::PRISMATICGHOST)                             p = &P_glowBoost;
@@ -2034,6 +2591,7 @@ int main()
             else if (currentMode == Mode::FLOWRIPPLE)                                 p = &P_rippleDecay;
             else if (currentMode == Mode::TURBULENCE)                                 p = &P_turbShift;
             else if (currentMode == Mode::GHOSTECHO || currentMode == Mode::CHROMAGHOSTECHO) p = &P_ghostSpace;
+            else if (currentMode == Mode::MASKEDGHOST || currentMode == Mode::CHROMAMASKEDGHOST) p = &P_tghostSpace;
             else if (currentMode == Mode::TIMEGHOST  || currentMode == Mode::RAINBOWGHOST)   p = &P_tghostSpace;
             else if (currentMode == Mode::TUNNELGHOST || currentMode == Mode::TUNNELTIMEGHOST) p = &P_tunnelScale;
             else if (currentMode == Mode::PRISMATICGHOST)                             p = &P_glowBoost;
@@ -2050,6 +2608,7 @@ int main()
     }
 
     running = false;
+    saveSettings();
     captureThread.join();
     prepThread.join();
     segThread.join();

@@ -120,7 +120,7 @@ This project captures live webcam footage and applies a time-displacement effect
 
 ### Special Effect Modes (many keys toggle between two related variants)
 - **T** - Prismatic Echo / Prismatic Ghost (press again to toggle): Echo=spectral hue-tinted buffer echoes; Ghost=Vision masks + additive glow + radial ring backdrop
-- **Y** - Flow Color Ripple / Flow Direction Color (toggle): Ripple=color advects with flow; Direction=flow dir→hue, mag→sat
+- **Y** - Masked Ghost / Chroma Masked Ghost (toggle): 5 Vision masks boolean-OR'd into union silhouette; 10 additive image echoes within mask; Chroma=spectral hue tints on echoes
 - **U** - Datamosh (IIR motion diff accumulation — moving subjects leave bright color trails)
 - **I** - Turbulence (motion history accumulation drives pixel displacement + chroma split + saturation boost)
 - **G** - Rainbow Ghost / Tunnel Ghost (toggle): Rainbow=flat cycling-hue person echoes; Tunnel=same but older echoes zoomed
@@ -130,17 +130,38 @@ This project captures live webcam footage and applies a time-displacement effect
 - **Z** - Motion Adaptive (displacement intensity scales with per-pixel motion)
 - **X** - Chromatic Time Shift (R/G/B channels pulled from slightly different frames)
 - **C** - Ghost Echo / Chroma Ghost Echo (toggle): Echo=motion-masked weighted blend; Chroma=same with cycling hue tints
+- **B** - Flow Color Ripple / Flow Direction Color (toggle): Ripple=color advects with flow; Direction=flow dir→hue, mag→sat
 - **V** - Flow Warp (optical flow displaces live camera; motion warps the image)
 
+### Color Modifier Combos (direction key + effect key within 0.5s)
+Hold a direction key (W/S/A/D) then tap an effect key to apply a color grade to the direction mode:
+- **+T** → Psych Cycle (animated psychedelic sine-wave palette)
+- **+Y** → Vaporwave (cycling pink/cyan/yellow/navy palette with sine-band mapping)
+- **+U** → False Poster (5-stop blue→cyan→green palette mapped to luma)
+- **+I** → Cel Shade (posterized 4-level cartoon shading)
+- **+G** → Neon (high-contrast black background with vivid color peaks)
+- **+H** → Thermal (blue→green→red heat-map palette)
+- **+J** → False 2 (alternative false-color palette)
+- **+K** → Infrared (grayscale-inverted with red highlights)
+
 ### Controls
-- **Arrow Up/Down** - Adjust speed (lines per frame)
-- **R** - Reset speed to 1
+- **Arrow Up/Down** - Adjust current mode parameter (or speed in direction modes)
+- **Arrow Left/Right** - Navigate settings menu columns
+- **R** - Reset current parameter to default
+- **;** - Open/close settings menu (edit param value, default, min, max, step)
 - **F** - Toggle fullscreen
-- **Q/ESC** - Quit
+- **Q/ESC** - Quit (ESC also closes settings menu)
+
+### Settings Menu
+- Open with **;** — lists all mode parameters with current value, default, min, max, step
+- Arrow Up/Down → select row; Arrow Left/Right → select column (value/def/min/max/step)
+- **+/-** → increment/decrement selected cell
+- **S** → save to `settings.cfg` (also auto-saved on quit, auto-loaded on startup)
 
 ### UI Features
+- Starts in fullscreen
 - Clean fullscreen view (no permanent overlays)
-- Speed indicator appears for 3 seconds when changed
+- Speed/parameter indicator appears for 3 seconds when changed
 - Terminal logging of FPS and current mode
 
 ## Installation & Setup

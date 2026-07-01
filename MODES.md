@@ -81,13 +81,19 @@ Output = HSV → BGR inline (no intermediate Mat)
 - Still pixels → desaturated (sat ≈ 0)
 - Up/Down adjusts `flowSensitivity`
 
-### Y — Flow Color Ripple
+### Y — Masked Ghost / Chroma Masked Ghost (toggle)
 ```
-Per-pixel hue assigned by flow direction; colour advects with flow vectors
-IIR decay: rippleBuffer = rippleBuffer * rippleDecay + newColour
+Mask layer:  5 Vision masks at tghostSpace spacing, boolean-OR'd → unionMask
+Image layer: 10 echoes at ghostSpace spacing, accumulated additively:
+  B += frame[e][x] × iw[e]  (iw[e] = 1 − e/10, wsum ≈ 5.5)
+  output = clip(B × unionAlpha / wsum)
+Chroma variant: each echo's pixel replaced by luma × spectral hue (cycling rainbowHue)
+Ring backdrop: expanding concentric rings behind all echoes
 ```
-- Default `rippleDecay = 0.93` (~1 second fade at 60 fps)
-- Colours persist and drift with motion; still areas fade to grey
+- Up/Down adjusts `tghostSpace` (mask echo spacing)
+- `ghostSpace` controls image echo spacing (edit in settings menu)
+- Union mask: a pixel is "on" if ANY of the 5 time-offset masks detects the person there — larger combined silhouette for a moving subject
+- Chroma variant cycles `rainbowHue` each frame (shared with G, T-alt)
 
 ### I — Turbulence
 ```
@@ -163,6 +169,21 @@ Prismatic Ghost variant: `pixel = (dist/maxDist) × 35` for light sections (radi
 
 ---
 
+### B — Flow Color Ripple / Flow Direction Color (toggle)
+```
+Flow Color Ripple:
+  Per-pixel hue assigned by flow direction; colour advects with flow vectors
+  IIR decay: rippleBuffer = rippleBuffer × rippleDecay + newColour
+Flow Direction Color:
+  hue = atan2(vy, vx)  (flow direction)
+  sat = min(mag / flowSens, 1.0)
+  val = pixel brightness
+  Output = HSV → BGR inline
+```
+- Ripple: Up/Down adjusts `rippleDecay` (default 0.93, ~1 s fade at 60 fps)
+- Direction: Up/Down adjusts `flowSens` (default 10 px/frame)
+- Both modes use Farneback optical flow from `preprocessLoop` (double-buffered `flowMapBuf`)
+
 ### V — Flow Warp
 ```
 (vx, vy) = Farneback optical flow at FLOW_SCALE (0.25×), scaled to full-res units
@@ -175,7 +196,9 @@ output[y][x] = frameBuffer[recent][sy][sx]
 - Fast motion → large displacement; still areas → identity (no warp)
 - Up/Down adjusts `flowWarpScale` (range: 1 – 50)
 
-### N — Wave Warp
+### K — Wave Warp / Chroma Wave (toggle)
+
+#### K1 — Wave Warp
 ```
 Wave propagation (explicit Euler, per frame):
   new[y][x] = (N+S+E+W) × 0.5 − prev[y][x]   (wave equation)
@@ -190,7 +213,7 @@ Displacement:
 - Motion map seeded from preprocessLoop; full frame (including person) is distorted
 - Double-buffered `waveA`/`waveB` swapped each frame (`std::swap`, O(1))
 
-### M — Chroma Wave
+#### K2 — Chroma Wave
 ```
 Three independent wave simulations — one per RGB channel.
 Each seeded from its own channel's absdiff (not grayscale motion map):
@@ -209,7 +232,7 @@ Per-channel displacement:
 
 ---
 
-## Segmentation subsystem (H, G, B modes)
+## Segmentation subsystem (H, G, Y modes)
 
 Person segmentation uses `VNGeneratePersonSegmentationRequest` from Apple's Vision framework (macOS 12+). No Python, MediaPipe, or external model files required.
 

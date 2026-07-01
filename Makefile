@@ -33,6 +33,31 @@ dist: time_mirror
 	  while install_name_tool -delete_rpath @executable_path/libs/ "$$f" 2>/dev/null; do :; done; \
 	  install_name_tool -add_rpath @executable_path/libs/ "$$f" 2>/dev/null || true; \
 	done
+	@echo "Trimming DNN/BLAS chain (~55 MB)..."
+	@for f in dist/libs/libopencv_dnn.*.dylib dist/libs/libopencv_calib3d.*.dylib; do \
+	  [ -f "$$f" ] || continue; \
+	  fname=$$(basename "$$f"); \
+	  printf '' | clang -dynamiclib \
+	    -install_name "@executable_path/libs/$$fname" \
+	    -compatibility_version 413.0.0 -current_version 4.13.0 \
+	    -x c - -o "$$f"; \
+	done
+	@for blas in dist/libs/libopenblas*.dylib; do \
+	  [ -f "$$blas" ] || continue; \
+	  name=$$(basename "$$blas"); \
+	  for lib in dist/libs/*.dylib; do \
+	    install_name_tool -change "@executable_path/libs/$$name" \
+	      /System/Library/Frameworks/Accelerate.framework/Versions/A/Accelerate \
+	      "$$lib" 2>/dev/null || true; \
+	  done; \
+	done
+	@rm -f dist/libs/libopenvino*.dylib \
+	       dist/libs/libprotobuf*.dylib \
+	       dist/libs/libopenblas*.dylib \
+	       dist/libs/libgfortran*.dylib \
+	       dist/libs/libopencv_features2d*.dylib \
+	       dist/libs/libopencv_flann*.dylib
+	@du -sh dist/libs/
 	zip -r9 time_mirror_mac.zip dist/
 	@echo "Built: time_mirror_mac.zip ($$(du -sh time_mirror_mac.zip | cut -f1))"
 
@@ -53,7 +78,8 @@ app: dist
   <key>NSCameraUsageDescription</key><string>Required for webcam capture</string>\n\
   <key>NSHighResolutionCapable</key><true/>\n\
 </dict></plist>\n' > $(APP_BUNDLE)/Contents/Info.plist
-	find $(APP_MACOS)/libs -name "*.dylib" -exec codesign --force --sign "$(SIGN_ID)" --timestamp --options runtime {} \;
+	find $(APP_MACOS)/libs -name "*.dylib" -exec codesign --remove-signature {} \; 2>/dev/null; true
+	find $(APP_MACOS)/libs -name "*.dylib" -exec codesign --force --sign "$(SIGN_ID)" --timestamp {} \;
 	codesign --force --sign "$(SIGN_ID)" --timestamp --options runtime --entitlements $(ENTITLEMENTS) $(APP_MACOS)/time_mirror
 	codesign --force --sign "$(SIGN_ID)" --timestamp --options runtime --entitlements $(ENTITLEMENTS) $(APP_BUNDLE)
 	codesign --verify --deep --strict $(APP_BUNDLE) && echo "Signature OK"
